@@ -303,10 +303,14 @@ func handleMessage(bot *tgbotapi.BotAPI, cfg Config, sem chan struct{}, msg *tgb
 		sendHomePanel(bot, cfg, chatID, userID)
 		return
 	case "/help":
-		sendHelpPanel(bot, cfg, chatID)
+		sendHelpPanel(bot, cfg, chatID, userID)
 		return
 	case "/status":
-		sendStatusPanel(bot, cfg, chatID)
+		if !isAdminUser(cfg, userID) {
+			sendUserOnlyPanel(bot, cfg, chatID, userID)
+			return
+		}
+		sendStatusPanel(bot, cfg, chatID, userID)
 		return
 	case "/my_sites":
 		sendMySitesPanel(bot, cfg, chatID, userID)
@@ -546,9 +550,13 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, cfg Config, cq *tgbotapi.Callback
 	case data == "upload:guide":
 		sendUploadGuidePanel(bot, cfg, chatID)
 	case data == "help:show":
-		sendHelpPanel(bot, cfg, chatID)
+		sendHelpPanel(bot, cfg, chatID, userID)
 	case data == "status:show":
-		sendStatusPanel(bot, cfg, chatID)
+		if !isAdminUser(cfg, userID) {
+			sendUserOnlyPanel(bot, cfg, chatID, userID)
+			return
+		}
+		sendStatusPanel(bot, cfg, chatID, userID)
 	case data == "sites:list", data == "sites:refresh":
 		sendMySitesPanel(bot, cfg, chatID, userID)
 	case data == "password:menu":
@@ -630,7 +638,7 @@ func sendHomePanel(bot *tgbotapi.BotAPI, cfg Config, chatID, userID int64) {
 		len(store.ByUser(userID)),
 	)
 
-	sendWithButtons(bot, chatID, text, mainMenuKeyboard(cfg))
+	sendWithButtons(bot, chatID, text, mainMenuKeyboard(cfg, userID))
 }
 
 func sendUploadGuidePanel(bot *tgbotapi.BotAPI, cfg Config, chatID int64) {
@@ -658,11 +666,11 @@ func sendUploadGuidePanel(bot *tgbotapi.BotAPI, cfg Config, chatID int64) {
 	})
 }
 
-func sendHelpPanel(bot *tgbotapi.BotAPI, cfg Config, chatID int64) {
-	sendWithButtons(bot, chatID, helpText(cfg), mainMenuKeyboard(cfg))
+func sendHelpPanel(bot *tgbotapi.BotAPI, cfg Config, chatID, userID int64) {
+	sendWithButtons(bot, chatID, helpText(cfg), mainMenuKeyboard(cfg, userID))
 }
 
-func sendStatusPanel(bot *tgbotapi.BotAPI, cfg Config, chatID int64) {
+func sendStatusPanel(bot *tgbotapi.BotAPI, cfg Config, chatID, userID int64) {
 	sendWithButtons(bot, chatID, statusText(cfg), [][]tgbotapi.InlineKeyboardButton{
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "status:show"),
@@ -702,23 +710,38 @@ func sendMySitesPanel(bot *tgbotapi.BotAPI, cfg Config, chatID, userID int64) {
 	sendWithButtons(bot, chatID, mySitesText(cfg, userID), sitesKeyboard(cfg, sites))
 }
 
-func mainMenuKeyboard(cfg Config) [][]tgbotapi.InlineKeyboardButton {
+func sendUserOnlyPanel(bot *tgbotapi.BotAPI, cfg Config, chatID, userID int64) {
+	sendWithButtons(bot, chatID,
+		"⛔ *Admin only*\n\nYour account can upload project files and manage your own hosted sites only\\.",
+		mainMenuKeyboard(cfg, userID),
+	)
+}
+
+func mainMenuKeyboard(cfg Config, userID int64) [][]tgbotapi.InlineKeyboardButton {
 	rows := [][]tgbotapi.InlineKeyboardButton{
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("📤 Upload Guide", "upload:guide"),
+			tgbotapi.NewInlineKeyboardButtonData("📤 Upload Project", "upload:guide"),
 			tgbotapi.NewInlineKeyboardButtonData("🌐 My Sites", "sites:list"),
 		),
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("🔐 Password", "password:menu"),
-			tgbotapi.NewInlineKeyboardButtonData("📊 Status", "status:show"),
+			tgbotapi.NewInlineKeyboardButtonData("📖 Help", "help:show"),
 		),
-		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("📖 Help", "help:show")),
 	}
-	if cfg.AdminPassword != "" && cfg.PublicBaseURL != "" {
+
+	// Only Telegram IDs in ADMIN_USER_IDS can see admin controls in the bot UI.
+	// Normal users only get upload/project-management actions.
+	if isAdminUser(cfg, userID) {
 		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonURL("🛠 Admin Dashboard", cfg.PublicBaseURL+cfg.AdminPath),
+			tgbotapi.NewInlineKeyboardButtonData("📊 Admin Status", "status:show"),
 		))
+		if cfg.AdminPassword != "" && cfg.PublicBaseURL != "" {
+			rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonURL("🛠 Admin Dashboard", cfg.PublicBaseURL+cfg.AdminPath),
+			))
+		}
 	}
+
 	return rows
 }
 
@@ -1019,13 +1042,13 @@ func mySitesText(cfg Config, userID int64) string {
 }
 
 func helpText(cfg Config) string {
-	admin := "disabled"
-	if cfg.AdminPassword != "" && cfg.PublicBaseURL != "" {
-		admin = cfg.PublicBaseURL + cfg.AdminPath
+	admin := "hidden from normal users"
+	if cfg.AdminPassword == "" {
+		admin = "disabled"
 	}
 
 	return fmt.Sprintf(
-		"🌐 *Telegram Static Site Host Bot V4*\n\n"+
+		"🌐 *Telegram Static Site Host Bot V5*\n\n"+
 			"*Button\\-first interface*\n"+
 			"Use the menu buttons for Upload Guide, My Sites, Password, Status, Extend, and Delete\\.\n\n"+
 			"*How it works:*\n"+
@@ -1977,15 +2000,15 @@ func writeHomePage(w http.ResponseWriter, cfg Config) {
 	adminStatus := "disabled"
 	adminLink := ""
 	if cfg.AdminPassword != "" {
-		adminStatus = "enabled"
-		adminLink = fmt.Sprintf(` — <a href="%s">Open Dashboard</a>`, html.EscapeString(cfg.AdminPath))
+		adminStatus = "protected"
+		adminLink = " — hidden from normal users"
 	}
 
 	_, _ = fmt.Fprintf(w, `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Telegram Static Site Host Bot V2</title>
+<title>Telegram Static Site Host Bot V5</title>
 <style>
 *{box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;background:#0b1020;color:#e8eefc;margin:0;padding:32px 20px;min-height:100vh}
@@ -2004,7 +2027,7 @@ code{background:#0b1020;border:1px solid #26345e;border-radius:6px;padding:2px 6
 </style>
 </head><body>
 <div class="card">
-<h1>🌐 Telegram Static Site Host Bot V2</h1>
+<h1>🌐 Telegram Static Site Host Bot V5</h1>
 <p class="desc">Upload a <code>.zip</code> project (must contain <code>index.html</code>) to the Telegram bot to get a temporary public website URL and QR code instantly.</p>
 <div class="grid">
   <div class="metric"><label>Link TTL</label><b>%s</b></div>
@@ -2661,15 +2684,12 @@ func usernameFromMessage(msg *tgbotapi.Message) string {
 	return name
 }
 
-// isAdminUser returns true if userID is listed in ADMIN_USER_IDS.
-// Falls back to ALLOWED_USER_IDS if no dedicated admin list is configured.
+// isAdminUser returns true only when userID is explicitly listed in ADMIN_USER_IDS.
+// IMPORTANT: ALLOWED_USER_IDS only controls who can use/upload with the bot.
+// It does not grant admin permissions.
 func isAdminUser(cfg Config, userID int64) bool {
-	if cfg.AdminUserIDs != nil {
-		return cfg.AdminUserIDs[userID]
+	if cfg.AdminUserIDs == nil {
+		return false
 	}
-	// When no dedicated admin list, allowed users are treated as admins
-	if cfg.AllowedUsers != nil {
-		return cfg.AllowedUsers[userID]
-	}
-	return false
+	return cfg.AdminUserIDs[userID]
 }
