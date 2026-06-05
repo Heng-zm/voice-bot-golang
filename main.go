@@ -558,14 +558,21 @@ func handleMessage(bot *tgbotapi.BotAPI, cfg Config, sem chan struct{}, msg *tgb
 
 	warningsBlock := ""
 	if len(scan.Warnings) > 0 {
-		warningsBlock = "\n\n⚠️ *Warnings*\n" + "• " + strings.Join(scan.Warnings, "\n• ")
+		escapedWarnings := make([]string, len(scan.Warnings))
+		for i, w := range scan.Warnings {
+			escapedWarnings[i] = escapeMarkdownV2(w)
+		}
+		warningsBlock = "\n\n⚠️ *Warnings*\n" + "• " + strings.Join(escapedWarnings, "\n• ")
 	}
+
+	// Escape dots in float values to satisfy Telegram's Markdown V2 parser
+	sizeMBStr := escapeMarkdownV2(fmt.Sprintf("%.2f", float64(sizeBytes)/(1024*1024)))
 
 	reply := fmt.Sprintf(
 		"✅ *Website is live\\!*\n\n"+
 			"📁 `%s`\n"+
 			"🔧 %s\n"+
-			"📄 %d files  •  %.2f MB\n"+
+			"📄 %d files  •  %s MB\n"+
 			"%s\n"+
 			"⏱ Expires in *%s*\n\n"+
 			"🌐 [Open Website](%s)\n"+
@@ -574,12 +581,12 @@ func handleMessage(bot *tgbotapi.BotAPI, cfg Config, sem chan struct{}, msg *tgb
 		escapeMarkdownV2(truncate(fileName, 80)),
 		escapeMarkdownV2(projectType),
 		fileCount,
-		float64(sizeBytes)/(1024*1024),
+		sizeMBStr,
 		escapeMarkdownV2(passwordLine),
 		escapeMarkdownV2(humanDuration(time.Until(site.ExpiresAt))),
 		publicURL,
 		escapeMarkdownV2(publicURL),
-		escapeMarkdownV2(warningsBlock),
+		warningsBlock,
 		escapeMarkdownV2(token),
 	)
 
@@ -667,7 +674,7 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, cfg Config, cq *tgbotapi.Callback
 	case data == "password:off":
 		users.SetPassword(userID, "")
 		sendWithButtons(bot, chatID,
-			"✅ *Password protection disabled*\n\nYour next uploads will be public\\.",
+			"🔓 *Password protection disabled*\n\nYour next uploads will be public\\.",
 			passwordKeyboard(),
 		)
 	case data == "password:cancel":
@@ -1012,7 +1019,7 @@ func handlePasswordCommand(bot *tgbotapi.BotAPI, chatID, userID int64, text stri
 
 	if strings.EqualFold(args, "off") || strings.EqualFold(args, "none") || strings.EqualFold(args, "disable") {
 		users.SetPassword(userID, "")
-		sendWithButtons(bot, chatID, "✅ *Password protection disabled*\n\nYour next uploads will be public\\.", passwordKeyboard())
+		sendWithButtons(bot, chatID, "🔓 *Password protection disabled*\n\nYour next uploads will be public\\.", passwordKeyboard())
 		return
 	}
 
@@ -1134,10 +1141,13 @@ func mySitesText(cfg Config, userID int64) string {
 			pwd = "🔒 Password protected"
 		}
 
+		// Escape size decimals to satisfy Markdown V2
+		sizeMBStr := escapeMarkdownV2(fmt.Sprintf("%.2f", float64(s.SizeBytes)/(1024*1024)))
+
 		b.WriteString(fmt.Sprintf(
 			"*%d\\.* `%s`\n"+
 				"   🔧 %s\n"+
-				"   📄 %d files  •  %.2f MB\n"+
+				"   📄 %d files  •  %s MB\n"+
 				"   👁 %d views  •  %s\n"+
 				"   ⏱ Expires in *%s*\n"+
 				"   📋 Token: `%s`\n\n",
@@ -1145,7 +1155,7 @@ func mySitesText(cfg Config, userID int64) string {
 			escapeMarkdownV2(truncate(s.OriginalName, 60)),
 			escapeMarkdownV2(s.ProjectType),
 			s.FileCount,
-			float64(s.SizeBytes)/(1024*1024),
+			sizeMBStr,
 			s.ViewCount,
 			escapeMarkdownV2(pwd),
 			escapeMarkdownV2(humanDuration(time.Until(s.ExpiresAt))),
@@ -1580,12 +1590,12 @@ func detectProjectRootAndType(destDir string) (string, string, error) {
 
 	// Deep search fallback
 	var indexes []string
-	err := filepath.WalkDir(destDir, func(path string, d fs.DirEntry, walkErr error) error {
+	err := filepath.WalkDir(destDir, func(pathVal string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
 		if !d.IsDir() && strings.EqualFold(d.Name(), "index.html") {
-			indexes = append(indexes, path)
+			indexes = append(indexes, pathVal)
 		}
 		return nil
 	})
@@ -2849,6 +2859,9 @@ func newR2Storage(ctx context.Context, cfg Config) (*R2Storage, error) {
 	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
 		o.BaseEndpoint = aws.String(endpoint)
 		o.UsePathStyle = true
+		// Disable AWS SDK standard checksumming behaviors that conflict with Cloudflare R2 signature mechanisms
+		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 	})
 	return &R2Storage{client: client, bucket: cfg.R2Bucket, prefix: cfg.R2KeyPrefix}, nil
 }
