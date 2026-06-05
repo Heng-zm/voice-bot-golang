@@ -1,207 +1,122 @@
-# Telegram Static Site Host Bot V2 - Go
+# Telegram Static Site Host Bot V6
 
-This bot accepts a user-uploaded `.zip` HTML project or single `.html` file, hosts it as a temporary public website, and returns a public URL + QR Code.
+Button-first Telegram bot for temporary static website hosting.
 
-## New V2 features
+## V6 update
 
-- QR Code for Website Link
-- Admin Dashboard
-- Auto Detect Project Type
-- Password Protected Website
-- User Project Manager in Telegram
-- ZIP Security Scanner
+This version adds:
 
-## Flow
+- Cloudflare R2 storage backend for uploaded static site files
+- Custom domain mapping by HTTP `Host` header
+- Optional Cloudflare DNS automation for custom domains
+- Supabase persistence for users, hosted sites, domains, and upload logs
+- Strict normal-user/admin separation
 
-1. User uploads `project.zip` to Telegram bot.
-2. ZIP must contain `index.html`.
-3. Bot scans ZIP for unsafe files and paths.
-4. Bot auto-detects the best website root folder.
-5. Bot hosts the project at:
+Normal users can only:
 
-```text
-https://your-service-name.onrender.com/s/<secure-token>/
-```
+- Upload `.zip`, `.html`, or `.htm` static project files
+- Open their own hosted sites
+- Extend/delete their own hosted sites
+- Set password protection for their next upload
 
-6. Bot sends the URL and a QR code.
-7. Link expires after 1 hour by default.
-8. Files are auto-deleted after expiration.
+Only admins in `ADMIN_USER_IDS` can:
 
-## Supported
+- See admin controls
+- Open admin status/dashboard
+- Add custom domains
+- Trigger Cloudflare DNS automation
 
-- HTML
-- CSS
-- JavaScript
-- Images
-- Fonts
-- JSON
-- Static assets
-- React/Vite/Vue/Angular/Next static exports
-- Single `.html` file
-
-## Not supported
-
-- PHP
-- Python backend
-- Node backend
-- Database server
-- Server-side code execution
-
-## Telegram commands
-
-```text
-/start
-/help
-/status
-/my_sites
-/delete_site TOKEN
-/extend_site TOKEN 60
-/password 1234
-/password off
-```
-
-## Password protected website
-
-Before uploading a ZIP, send:
-
-```text
-/password 1234
-```
-
-Then upload your project ZIP. The website will require password `1234`.
-
-Disable password protection for next uploads:
-
-```text
-/password off
-```
-
-## Admin Dashboard
-
-Set env:
+## Required setup
 
 ```env
-ADMIN_USERNAME=admin
-ADMIN_PASSWORD=your-strong-password
-ADMIN_PATH=/admin
+TELEGRAM_BOT_TOKEN=123456:telegram-token
+PUBLIC_BASE_URL=https://your-service.onrender.com
+COOKIE_SECRET=generate-a-long-random-secret
+ADMIN_USER_IDS=1272791365
 ```
 
-Open:
+## Cloudflare R2 setup
+
+```env
+STORAGE_DRIVER=r2
+CLOUDFLARE_ACCOUNT_ID=your_cloudflare_account_id
+R2_ACCESS_KEY_ID=your_r2_access_key_id
+R2_SECRET_ACCESS_KEY=your_r2_secret_access_key
+R2_BUCKET=telegram-sites
+R2_REGION=auto
+R2_KEY_PREFIX=sites
+```
+
+When `STORAGE_DRIVER=r2` is enabled, uploaded site files are copied to R2 after extraction and security scanning. The Go server still handles password protection, expiry checks, `/s/TOKEN/` routing, and custom-domain routing.
+
+## Custom domain setup
+
+For automatic DNS records:
+
+```env
+CLOUDFLARE_API_TOKEN=your_cloudflare_dns_edit_token
+CLOUDFLARE_ZONE_ID=your_cloudflare_zone_id
+CUSTOM_DOMAIN_TARGET=your-service.onrender.com
+```
+
+Admin flow:
+
+1. Open **My Sites**
+2. Tap **Add Domain** beside a site
+3. Send a domain like `demo.example.com`
+4. Bot stores the mapping and creates/updates a Cloudflare CNAME if API env vars are set
+
+If Cloudflare DNS automation is disabled, manually add:
 
 ```text
-https://your-service-name.onrender.com/admin
+CNAME demo.example.com -> your-service.onrender.com
 ```
 
-Admin can:
+## Supabase setup
 
-- View active sites
-- Open sites
-- See views, size, files, project type
-- Extend expiration
-- Delete sites
-
-## Render deploy
-
-Use **Web Service + Docker**.
-
-```text
-Service Type: Web Service
-Runtime: Docker
-Dockerfile Path: ./Dockerfile
-Build Command: empty
-Start Command: empty
-```
-
-Required environment variables:
+Run `supabase_schema.sql` in Supabase SQL Editor, then set:
 
 ```env
-TELEGRAM_BOT_TOKEN=your_botfather_token
-PUBLIC_BASE_URL=https://your-service-name.onrender.com
-ADMIN_PASSWORD=your-strong-password
+SUPABASE_ENABLED=true
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
 ```
 
-Recommended environment variables:
+The bot stores:
 
-```env
-LINK_TTL_MINUTES=60
-MAX_LINK_TTL_MINUTES=1440
-MAX_PROJECT_MB=80
-MAX_SINGLE_FILE_MB=25
-MAX_ZIP_ENTRIES=1000
-MAX_CONCURRENT_UPLOADS=2
-SPA_FALLBACK=true
-KEEP_FILES_ON_STARTUP=false
-ADMIN_USERNAME=admin
-ADMIN_PATH=/admin
-```
+- `bot_users` — Telegram user profile and admin/allowed flags
+- `hosted_sites` — site metadata, expiry, storage info, view count
+- `site_domains` — custom domain to site-token mapping
+- `upload_logs` — upload success/failure history
 
-Optional private bot:
+Use the service role key only on your server. Do not expose it in frontend code.
 
-```env
-ALLOWED_USER_IDS=1272791365
-```
-
-## Local run
+## Build
 
 ```bash
-go mod tidy
-export TELEGRAM_BOT_TOKEN="YOUR_BOT_TOKEN"
-export PUBLIC_BASE_URL="http://localhost:8080"
-export ADMIN_PASSWORD="admin1234"
+go mod download
+go build -o app .
+```
+
+## Run locally
+
+```bash
+cp .env.example .env
+# edit .env
+export $(grep -v '^#' .env | xargs)
 go run .
 ```
 
-Open:
+## Docker
 
-```text
-http://localhost:8080
-http://localhost:8080/admin
-http://localhost:8080/healthz
+```bash
+docker build -t static-site-host-bot:v6 .
+docker run --env-file .env -p 8080:8080 static-site-host-bot:v6
 ```
 
-## ZIP Security Scanner
+## Notes
 
-The scanner blocks:
-
-- Unsafe paths like `../`
-- Symlinks
-- PHP, Python, shell, EXE, DLL, SQL/db files
-- `.env`, private keys
-- `.git`, `node_modules`, cache folders
-- Too many files
-- Files too large
-- Project too large
-- Too-deep folders
-
-## Auto Detect Project Type
-
-The bot checks common project folders:
-
-```text
-/
-dist/
-build/
-public/
-out/
-www/
-project-folder/dist/
-project-folder/build/
-```
-
-Then detects:
-
-```text
-Vite static build
-Vue static build
-Angular static build
-Next.js static export
-Nuxt static export
-Svelte static build
-Astro static build
-Tailwind static site
-HTML static site
-```
-
-## Important limitation
-
-Sites are stored on local service disk and registered in memory. If Render restarts, old links can stop working. For permanent hosting, upgrade to Cloudflare R2, S3, or Supabase Storage.
+- Keep `ADMIN_USER_IDS` separate from `ALLOWED_USER_IDS`.
+- `ALLOWED_USER_IDS` lets users use/upload; it does not grant admin access.
+- Custom domains route through your Go server so password protection and expiry still work.
+- R2 is used as durable object storage; local files may still be used as a cache during the current process lifetime.
