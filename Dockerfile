@@ -1,11 +1,11 @@
 FROM golang:1.22-bookworm AS build
 
 WORKDIR /src
-COPY go.mod ./
+COPY go.mod go.sum ./
 RUN go mod download
 
-COPY main.go ./
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/bot .
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/app .
 
 FROM python:3.12-slim
 
@@ -15,7 +15,8 @@ RUN apt-get update \
     && python -m pip install --no-cache-dir -U "yt-dlp[default]"
 
 WORKDIR /app
-COPY --from=build /out/bot /app/bot
+COPY --from=build /out/app /app/app
+
 RUN mkdir -p /app/downloads
 
 ENV DOWNLOAD_DIR=/app/downloads
@@ -25,4 +26,4 @@ ENV DOWNLOAD_TIMEOUT_MINUTES=10
 ENV MAX_CONCURRENT_DOWNLOADS=2
 ENV ALLOW_PRIVATE_URLS=false
 
-CMD ["/app/bot"]
+CMD ["/app/app"]
