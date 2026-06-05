@@ -1848,7 +1848,7 @@ func editMD(bot *tgbotapi.BotAPI, chatID int64, messageID int, text string) {
 	}
 	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
 	edit.ParseMode = tgbotapi.ModeMarkdownV2
-	edit.DisableWebPagePreview = boolPtr(true)
+	edit.DisableWebPagePreview = true
 	_, _ = bot.Send(edit)
 }
 
@@ -1859,13 +1859,11 @@ func editMsgWithButtons(bot *tgbotapi.BotAPI, chatID int64, messageID int, text 
 	}
 	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
 	edit.ParseMode = tgbotapi.ModeMarkdownV2
-	edit.DisableWebPagePreview = boolPtr(true)
+	edit.DisableWebPagePreview = true
 	markup := tgbotapi.NewInlineKeyboardMarkup(buttons...)
 	edit.ReplyMarkup = &markup
 	_, _ = bot.Send(edit)
 }
-
-func boolPtr(b bool) *bool { return &b }
 
 // escapeMarkdownV2 escapes all special characters required by Telegram MarkdownV2.
 func escapeMarkdownV2(s string) string {
