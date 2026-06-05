@@ -17,6 +17,7 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -25,8 +26,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	qrcode "github.com/skip2/go-qrcode"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	qrcode "github.com/skip2/go-qrcode"
 )
 
 // ─────────────────────────────────────────────
@@ -52,6 +53,7 @@ type Config struct {
 	AdminPassword        string
 	AdminUsername        string
 	AdminPath            string
+	CookieSecret         string
 }
 
 type HostedSite struct {
@@ -97,12 +99,13 @@ type ScanResult struct {
 // ─────────────────────────────────────────────
 
 var (
-	startedAt     = time.Now()
-	activeUploads int64
-	totalSites    int64
-	totalViews    int64
-	store         = &SiteStore{sites: make(map[string]HostedSite)}
-	users         = &UserStore{settings: make(map[int64]UserSettings)}
+	startedAt          = time.Now()
+	activeUploads      int64
+	totalSites         int64
+	totalViews         int64
+	store              = &SiteStore{sites: make(map[string]HostedSite)}
+	users              = &UserStore{settings: make(map[int64]UserSettings)}
+	telegramHTTPClient = &http.Client{Timeout: 3 * time.Minute}
 )
 
 // ─────────────────────────────────────────────
@@ -219,10 +222,7 @@ func loadConfig() Config {
 		maxZipEntries = 1000
 	}
 
-	adminPath := envString("ADMIN_PATH", "/admin")
-	if !strings.HasPrefix(adminPath, "/") {
-		adminPath = "/" + adminPath
-	}
+	adminPath := sanitizeAdminPath(envString("ADMIN_PATH", "/admin"))
 
 	adminUsername := envString("ADMIN_USERNAME", "admin")
 
@@ -245,7 +245,38 @@ func loadConfig() Config {
 		AdminPassword:        strings.TrimSpace(os.Getenv("ADMIN_PASSWORD")),
 		AdminUsername:        adminUsername,
 		AdminPath:            adminPath,
+		CookieSecret:         loadCookieSecret(),
 	}
+}
+
+func sanitizeAdminPath(raw string) string {
+	adminPath := strings.TrimSpace(raw)
+	if adminPath == "" {
+		adminPath = "/admin"
+	}
+	if !strings.HasPrefix(adminPath, "/") {
+		adminPath = "/" + adminPath
+	}
+	adminPath = "/" + strings.Trim(path.Clean(adminPath), "/")
+	if adminPath == "/" || adminPath == "/s" || adminPath == "/healthz" {
+		log.Printf("unsafe ADMIN_PATH %q replaced with /admin", raw)
+		return "/admin"
+	}
+	return adminPath
+}
+
+func loadCookieSecret() string {
+	secret := strings.TrimSpace(os.Getenv("COOKIE_SECRET"))
+	if secret != "" {
+		return secret
+	}
+	generated, err := newToken()
+	if err != nil {
+		log.Printf("warning: cannot generate COOKIE_SECRET, falling back to process timestamp: %v", err)
+		return strconv.FormatInt(time.Now().UnixNano(), 10)
+	}
+	log.Println("warning: COOKIE_SECRET is not set; password cookies will reset on every restart")
+	return generated
 }
 
 // ─────────────────────────────────────────────
@@ -264,24 +295,25 @@ func handleMessage(bot *tgbotapi.BotAPI, cfg Config, sem chan struct{}, msg *tgb
 	}
 
 	text := strings.TrimSpace(msg.Text)
+	cmd := firstCommand(text)
 
-	switch {
-	case strings.HasPrefix(text, "/start"), strings.HasPrefix(text, "/help"):
+	switch cmd {
+	case "/start", "/help":
 		sendMD(bot, chatID, helpText(cfg))
 		return
-	case strings.HasPrefix(text, "/status"):
+	case "/status":
 		sendMD(bot, chatID, statusText(cfg))
 		return
-	case strings.HasPrefix(text, "/my_sites"):
+	case "/my_sites":
 		sendMD(bot, chatID, mySitesText(cfg, userID))
 		return
-	case strings.HasPrefix(text, "/delete_site"):
+	case "/delete_site":
 		handleDeleteSiteCommand(bot, cfg, chatID, userID, text)
 		return
-	case strings.HasPrefix(text, "/extend_site"):
+	case "/extend_site":
 		handleExtendSiteCommand(bot, cfg, chatID, userID, text)
 		return
-	case strings.HasPrefix(text, "/password"):
+	case "/password":
 		handlePasswordCommand(bot, chatID, userID, text)
 		return
 	}
@@ -488,13 +520,28 @@ func handleMessage(bot *tgbotapi.BotAPI, cfg Config, sem chan struct{}, msg *tgb
 // ─────────────────────────────────────────────
 
 func handleCallbackQuery(bot *tgbotapi.BotAPI, cfg Config, cq *tgbotapi.CallbackQuery) {
+	if cq == nil {
+		return
+	}
+
+	// Acknowledge the callback to remove the loading spinner.
+	callback := tgbotapi.NewCallback(cq.ID, "")
+	if _, err := bot.Request(callback); err != nil {
+		log.Printf("callback acknowledge failed: %v", err)
+	}
+
+	if cq.Message == nil || cq.From == nil {
+		return
+	}
+
 	chatID := cq.Message.Chat.ID
 	userID := cq.From.ID
 	data := strings.TrimSpace(cq.Data)
 
-	// Acknowledge the callback to remove the loading spinner
-	callback := tgbotapi.NewCallback(cq.ID, "")
-	_, _ = bot.Request(callback)
+	if cfg.AllowedUsers != nil && !cfg.AllowedUsers[userID] {
+		sendMD(bot, chatID, "⛔ You are not allowed to use this bot.")
+		return
+	}
 
 	switch {
 	case data == "/help":
@@ -775,7 +822,7 @@ func downloadTelegramFile(bot *tgbotapi.BotAPI, fileID string, dest string, maxB
 		return err
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := telegramHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -842,7 +889,11 @@ func extractZipProject(zipPath string, destDir string, cfg Config) (string, int6
 			return "", 0, 0, "", scan, err
 		}
 
-		target := filepath.Join(destClean, cleanName)
+		if isIgnoredArchivePath(cleanName) {
+			continue
+		}
+
+		target := filepath.Join(destClean, filepath.FromSlash(cleanName))
 		if !isInsideBase(destClean, target) {
 			return "", 0, 0, "", scan, fmt.Errorf("unsafe file path in zip: %s", f.Name)
 		}
@@ -925,6 +976,9 @@ func scanZip(files []*zip.File, cfg Config) (ScanResult, error) {
 		if err != nil {
 			return result, err
 		}
+		if isIgnoredArchivePath(cleanName) {
+			continue
+		}
 
 		if f.FileInfo().Mode()&os.ModeSymlink != 0 {
 			return result, fmt.Errorf("symlinks not allowed in zip: %s", f.Name)
@@ -965,6 +1019,10 @@ func scanZip(files []*zip.File, cfg Config) (ScanResult, error) {
 		}
 	}
 
+	if result.FileCount == 0 {
+		return result, errors.New("zip contains no usable files")
+	}
+
 	if len(result.BlockedFiles) > 0 {
 		show := result.BlockedFiles
 		if len(show) > 10 {
@@ -982,6 +1040,12 @@ func scanZip(files []*zip.File, cfg Config) (ScanResult, error) {
 	}
 
 	return result, nil
+}
+
+func isIgnoredArchivePath(cleanName string) bool {
+	lower := strings.ToLower(strings.ReplaceAll(cleanName, "\\", "/"))
+	base := path.Base(lower)
+	return strings.HasPrefix(lower, "__macosx/") || base == ".ds_store" || strings.HasSuffix(lower, "/thumbs.db")
 }
 
 func isBlockedPath(lowerPath, base, ext string) bool {
@@ -1202,6 +1266,10 @@ func startHTTPServer(cfg Config) {
 		Addr:              ":" + port,
 		Handler:           securityHeaders(mux),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      5 * time.Minute,
+		IdleTimeout:       90 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	log.Printf("HTTP server listening on :%s", port)
@@ -1345,7 +1413,7 @@ h2{margin:0 0 16px;font-size:16px;color:#aebce3;font-weight:500;text-transform:u
 .metric label{display:block;font-size:12px;color:#8ab4ff;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
 .metric b{display:block;font-size:28px;font-weight:700;line-height:1}
 .card{background:#121a33;border:1px solid #26345e;border-radius:16px;padding:20px;overflow-x:auto}
-table{width:100%;border-collapse:collapse;font-size:13px}
+table{width:100%%;border-collapse:collapse;font-size:13px}
 th{padding:10px 12px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#8ab4ff;border-bottom:1px solid #26345e;white-space:nowrap}
 td{padding:12px;border-bottom:1px solid #1a2444;vertical-align:middle}
 tr:last-child td{border-bottom:none}
@@ -1419,9 +1487,9 @@ func handleSiteRequest(w http.ResponseWriter, r *http.Request, cfg Config) {
 		return
 	}
 
-	if site.PasswordHash != "" && !isPasswordAuthed(r, site) {
+	if site.PasswordHash != "" && !isPasswordAuthed(r, cfg, site) {
 		if r.Method == http.MethodPost {
-			handleSiteLogin(w, r, site)
+			handleSiteLogin(w, r, cfg, site)
 			return
 		}
 		writePasswordPage(w, site)
@@ -1489,9 +1557,12 @@ func handleSiteRequest(w http.ResponseWriter, r *http.Request, cfg Config) {
 		}
 	}
 
-	site.ViewCount++
-	store.Update(site)
-	atomic.AddInt64(&totalViews, 1)
+	if shouldCountView(r, target) {
+		if updated, ok := store.IncrementView(token); ok {
+			site = updated
+		}
+		atomic.AddInt64(&totalViews, 1)
+	}
 
 	setStaticHeaders(w, target, site)
 	http.ServeFile(w, r, target)
@@ -1501,7 +1572,7 @@ func handleSiteRequest(w http.ResponseWriter, r *http.Request, cfg Config) {
 // Password auth
 // ─────────────────────────────────────────────
 
-func handleSiteLogin(w http.ResponseWriter, r *http.Request, site HostedSite) {
+func handleSiteLogin(w http.ResponseWriter, r *http.Request, cfg Config, site HostedSite) {
 	if err := r.ParseForm(); err != nil {
 		writePasswordPageWithError(w, site, "Invalid form submission.")
 		return
@@ -1515,10 +1586,12 @@ func handleSiteLogin(w http.ResponseWriter, r *http.Request, site HostedSite) {
 
 	cookie := &http.Cookie{
 		Name:     "site_auth_" + site.Token,
-		Value:    authCookieValue(site),
+		Value:    authCookieValue(site, cfg.CookieSecret),
 		Path:     "/s/" + site.Token + "/",
 		Expires:  site.ExpiresAt,
+		MaxAge:   int(time.Until(site.ExpiresAt).Seconds()),
 		HttpOnly: true,
+		Secure:   requestIsHTTPS(r),
 		SameSite: http.SameSiteLaxMode,
 	}
 
@@ -1526,18 +1599,22 @@ func handleSiteLogin(w http.ResponseWriter, r *http.Request, site HostedSite) {
 	http.Redirect(w, r, "/s/"+site.Token+"/", http.StatusSeeOther)
 }
 
-func isPasswordAuthed(r *http.Request, site HostedSite) bool {
+func isPasswordAuthed(r *http.Request, cfg Config, site HostedSite) bool {
 	cookie, err := r.Cookie("site_auth_" + site.Token)
 	if err != nil {
 		return false
 	}
-	expected := authCookieValue(site)
+	expected := authCookieValue(site, cfg.CookieSecret)
 	return subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(expected)) == 1
 }
 
-func authCookieValue(site HostedSite) string {
-	sum := sha256.Sum256([]byte(site.Token + ":" + site.PasswordHash + ":" + site.PasswordSalt))
+func authCookieValue(site HostedSite, secret string) string {
+	sum := sha256.Sum256([]byte(secret + ":" + site.Token + ":" + site.PasswordHash + ":" + site.PasswordSalt))
 	return hex.EncodeToString(sum[:])
+}
+
+func requestIsHTTPS(r *http.Request) bool {
+	return r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }
 
 // ─────────────────────────────────────────────
@@ -1697,6 +1774,14 @@ func cleanupExpiredSites() {
 // HTTP helpers
 // ─────────────────────────────────────────────
 
+func shouldCountView(r *http.Request, target string) bool {
+	if r.Method != http.MethodGet {
+		return false
+	}
+	ext := strings.ToLower(filepath.Ext(target))
+	return ext == ".html" || ext == ".htm"
+}
+
 func setStaticHeaders(w http.ResponseWriter, path string, site HostedSite) {
 	ext := strings.ToLower(filepath.Ext(path))
 	contentType := mime.TypeByExtension(ext)
@@ -1719,7 +1804,18 @@ func setStaticHeaders(w http.ResponseWriter, path string, site HostedSite) {
 		}
 	}
 	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Cache-Control", "no-store")
+	if ext == ".html" || ext == ".htm" {
+		w.Header().Set("Cache-Control", "no-store")
+	} else {
+		seconds := int(time.Until(site.ExpiresAt).Seconds())
+		if seconds < 0 {
+			seconds = 0
+		}
+		if seconds > 3600 {
+			seconds = 3600
+		}
+		w.Header().Set("Cache-Control", fmt.Sprintf("private, max-age=%d", seconds))
+	}
 	w.Header().Set("X-Link-Expires-At", site.ExpiresAt.Format(time.RFC3339))
 }
 
@@ -1728,6 +1824,7 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Robots-Tag", "noindex, nofollow")
+		w.Header().Set("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -1753,6 +1850,18 @@ func (s *SiteStore) Get(token string) (HostedSite, bool) {
 	defer s.mu.RUnlock()
 	site, ok := s.sites[token]
 	return site, ok
+}
+
+func (s *SiteStore) IncrementView(token string) (HostedSite, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	site, ok := s.sites[token]
+	if !ok {
+		return HostedSite{}, false
+	}
+	site.ViewCount++
+	s.sites[token] = site
+	return site, true
 }
 
 func (s *SiteStore) Delete(token string) {
@@ -1824,24 +1933,39 @@ func (u *UserStore) SetPassword(userID int64, password string) {
 // Telegram helpers
 // ─────────────────────────────────────────────
 
-// sendMD sends a MarkdownV2-formatted message.
+// sendMD sends a MarkdownV2-formatted message and falls back to plain text
+// if Telegram rejects the Markdown. This prevents parse errors from breaking UX.
 func sendMD(bot *tgbotapi.BotAPI, chatID int64, text string) {
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = tgbotapi.ModeMarkdownV2
 	msg.DisableWebPagePreview = true
-	_, _ = bot.Send(msg)
+	if _, err := bot.Send(msg); err != nil {
+		log.Printf("telegram send markdown failed: %v", err)
+		msg.ParseMode = ""
+		msg.Text = plainFromMarkdownV2(text)
+		if _, err := bot.Send(msg); err != nil {
+			log.Printf("telegram send plain fallback failed: %v", err)
+		}
+	}
 }
 
-// sendWithButtons sends a MarkdownV2 message with inline keyboard.
+// sendWithButtons sends a MarkdownV2 message with inline keyboard and plain-text fallback.
 func sendWithButtons(bot *tgbotapi.BotAPI, chatID int64, text string, buttons [][]tgbotapi.InlineKeyboardButton) {
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = tgbotapi.ModeMarkdownV2
 	msg.DisableWebPagePreview = true
 	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(buttons...)
-	_, _ = bot.Send(msg)
+	if _, err := bot.Send(msg); err != nil {
+		log.Printf("telegram send buttons markdown failed: %v", err)
+		msg.ParseMode = ""
+		msg.Text = plainFromMarkdownV2(text)
+		if _, err := bot.Send(msg); err != nil {
+			log.Printf("telegram send buttons plain fallback failed: %v", err)
+		}
+	}
 }
 
-// editMD edits an existing message with MarkdownV2 text.
+// editMD edits an existing message with MarkdownV2 text and ignores harmless duplicate edits.
 func editMD(bot *tgbotapi.BotAPI, chatID int64, messageID int, text string) {
 	if messageID == 0 {
 		return
@@ -1849,7 +1973,17 @@ func editMD(bot *tgbotapi.BotAPI, chatID int64, messageID int, text string) {
 	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
 	edit.ParseMode = tgbotapi.ModeMarkdownV2
 	edit.DisableWebPagePreview = true
-	_, _ = bot.Send(edit)
+	if _, err := bot.Send(edit); err != nil {
+		if isMessageNotModified(err) {
+			return
+		}
+		log.Printf("telegram edit markdown failed: %v", err)
+		edit.ParseMode = ""
+		edit.Text = plainFromMarkdownV2(text)
+		if _, err := bot.Send(edit); err != nil && !isMessageNotModified(err) {
+			log.Printf("telegram edit plain fallback failed: %v", err)
+		}
+	}
 }
 
 // editMsgWithButtons edits an existing message with MarkdownV2 text and inline keyboard.
@@ -1862,7 +1996,30 @@ func editMsgWithButtons(bot *tgbotapi.BotAPI, chatID int64, messageID int, text 
 	edit.DisableWebPagePreview = true
 	markup := tgbotapi.NewInlineKeyboardMarkup(buttons...)
 	edit.ReplyMarkup = &markup
-	_, _ = bot.Send(edit)
+	if _, err := bot.Send(edit); err != nil {
+		if isMessageNotModified(err) {
+			return
+		}
+		log.Printf("telegram edit buttons markdown failed: %v", err)
+		edit.ParseMode = ""
+		edit.Text = plainFromMarkdownV2(text)
+		if _, err := bot.Send(edit); err != nil && !isMessageNotModified(err) {
+			log.Printf("telegram edit buttons plain fallback failed: %v", err)
+		}
+	}
+}
+
+func isMessageNotModified(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "message is not modified")
+}
+
+func plainFromMarkdownV2(s string) string {
+	replacer := strings.NewReplacer(
+		"\\_", "_", "\\*", "*", "\\[", "[", "\\]", "]", "\\(", "(", "\\)", ")",
+		"\\~", "~", "\\`", "`", "\\>", ">", "\\#", "#", "\\+", "+", "\\-", "-",
+		"\\=", "=", "\\|", "|", "\\{", "{", "\\}", "}", "\\.", ".", "\\!", "!",
+	)
+	return replacer.Replace(s)
 }
 
 // escapeMarkdownV2 escapes all special characters required by Telegram MarkdownV2.
@@ -1887,31 +2044,31 @@ func escapeMarkdownV2(s string) string {
 func cleanZipName(name string) (string, error) {
 	name = strings.ReplaceAll(name, "\\", "/")
 	name = strings.TrimPrefix(name, "/")
-	name = filepath.Clean(name)
+	name = path.Clean(name)
 
 	if name == "." || name == "" {
 		return "", errors.New("empty file path in zip")
 	}
-	if filepath.IsAbs(name) || strings.HasPrefix(name, ".."+string(filepath.Separator)) || name == ".." {
+	if strings.ContainsRune(name, 0) || name == ".." || strings.HasPrefix(name, "../") || strings.Contains(name, ":") {
 		return "", fmt.Errorf("unsafe file path in zip: %s", name)
 	}
 
 	return name, nil
 }
 
-func cleanURLPath(path string) (string, error) {
-	path = strings.ReplaceAll(path, "\\", "/")
-	path = strings.TrimPrefix(path, "/")
-	path = filepath.Clean(path)
+func cleanURLPath(urlPath string) (string, error) {
+	urlPath = strings.ReplaceAll(urlPath, "\\", "/")
+	urlPath = strings.TrimPrefix(urlPath, "/")
+	urlPath = path.Clean(urlPath)
 
-	if path == "." || path == "" {
+	if urlPath == "." || urlPath == "" {
 		return "index.html", nil
 	}
-	if filepath.IsAbs(path) || strings.HasPrefix(path, ".."+string(filepath.Separator)) || path == ".." {
+	if strings.ContainsRune(urlPath, 0) || urlPath == ".." || strings.HasPrefix(urlPath, "../") || strings.Contains(urlPath, ":") {
 		return "", errors.New("unsafe URL path")
 	}
 
-	return path, nil
+	return filepath.FromSlash(urlPath), nil
 }
 
 func isInsideBase(base string, target string) bool {
@@ -2006,20 +2163,45 @@ func newToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
+const passwordHashIterations = 120000
+
 func hashPassword(password string) (string, string, error) {
 	saltBytes := make([]byte, 16)
 	if _, err := rand.Read(saltBytes); err != nil {
 		return "", "", err
 	}
 	salt := hex.EncodeToString(saltBytes)
-	sum := sha256.Sum256([]byte(salt + ":" + password))
-	return salt, hex.EncodeToString(sum[:]), nil
+	derived := derivePasswordHash(password, salt, passwordHashIterations)
+	return salt, fmt.Sprintf("v2$%d$%s", passwordHashIterations, derived), nil
 }
 
 func verifyPassword(password, salt, expectedHash string) bool {
+	parts := strings.Split(expectedHash, "$")
+	if len(parts) == 3 && parts[0] == "v2" {
+		iterations, err := strconv.Atoi(parts[1])
+		if err != nil || iterations < 1 || iterations > 1000000 {
+			return false
+		}
+		got := derivePasswordHash(password, salt, iterations)
+		return subtle.ConstantTimeCompare([]byte(got), []byte(parts[2])) == 1
+	}
+
+	// Legacy compatibility for older in-memory records created by previous builds.
 	sum := sha256.Sum256([]byte(salt + ":" + password))
 	got := hex.EncodeToString(sum[:])
 	return subtle.ConstantTimeCompare([]byte(got), []byte(expectedHash)) == 1
+}
+
+func derivePasswordHash(password, salt string, iterations int) string {
+	material := []byte(salt + ":" + password)
+	sum := sha256.Sum256(material)
+	for i := 1; i < iterations; i++ {
+		next := make([]byte, 0, len(sum)+len(material))
+		next = append(next, sum[:]...)
+		next = append(next, material...)
+		sum = sha256.Sum256(next)
+	}
+	return hex.EncodeToString(sum[:])
 }
 
 // ─────────────────────────────────────────────
@@ -2153,6 +2335,18 @@ func parseUserIDs(raw string) map[int64]bool {
 // ─────────────────────────────────────────────
 // Message helpers
 // ─────────────────────────────────────────────
+
+func firstCommand(text string) string {
+	fields := strings.Fields(strings.TrimSpace(text))
+	if len(fields) == 0 {
+		return ""
+	}
+	cmd := fields[0]
+	if i := strings.Index(cmd, "@"); i >= 0 {
+		cmd = cmd[:i]
+	}
+	return strings.ToLower(cmd)
+}
 
 func safeFromID(msg *tgbotapi.Message) int64 {
 	if msg != nil && msg.From != nil {
