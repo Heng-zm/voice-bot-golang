@@ -1,23 +1,31 @@
-# Telegram Static Site Host Bot - Go
+# Telegram Static Site Host Bot V2 - Go
 
-This version removes video downloading completely.
+This bot accepts a user-uploaded `.zip` HTML project or single `.html` file, hosts it as a temporary public website, and returns a public URL + QR Code.
 
-The bot accepts a user-uploaded `.zip` HTML project or a single `.html` file, hosts it as a temporary public website, and returns a public URL.
+## New V2 features
+
+- QR Code for Website Link
+- Admin Dashboard
+- Auto Detect Project Type
+- Password Protected Website
+- User Project Manager in Telegram
+- ZIP Security Scanner
 
 ## Flow
 
 1. User uploads `project.zip` to Telegram bot.
 2. ZIP must contain `index.html`.
-3. Bot downloads the ZIP from Telegram.
-4. Bot safely extracts static files.
+3. Bot scans ZIP for unsafe files and paths.
+4. Bot auto-detects the best website root folder.
 5. Bot hosts the project at:
 
 ```text
 https://your-service-name.onrender.com/s/<secure-token>/
 ```
 
-6. Link expires after 1 hour by default.
-7. Files are auto-deleted after expiration.
+6. Bot sends the URL and a QR code.
+7. Link expires after 1 hour by default.
+8. Files are auto-deleted after expiration.
 
 ## Supported
 
@@ -28,6 +36,7 @@ https://your-service-name.onrender.com/s/<secure-token>/
 - Fonts
 - JSON
 - Static assets
+- React/Vite/Vue/Angular/Next static exports
 - Single `.html` file
 
 ## Not supported
@@ -38,7 +47,58 @@ https://your-service-name.onrender.com/s/<secure-token>/
 - Database server
 - Server-side code execution
 
-This is a static-site host only.
+## Telegram commands
+
+```text
+/start
+/help
+/status
+/my_sites
+/delete_site TOKEN
+/extend_site TOKEN 60
+/password 1234
+/password off
+```
+
+## Password protected website
+
+Before uploading a ZIP, send:
+
+```text
+/password 1234
+```
+
+Then upload your project ZIP. The website will require password `1234`.
+
+Disable password protection for next uploads:
+
+```text
+/password off
+```
+
+## Admin Dashboard
+
+Set env:
+
+```env
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=your-strong-password
+ADMIN_PATH=/admin
+```
+
+Open:
+
+```text
+https://your-service-name.onrender.com/admin
+```
+
+Admin can:
+
+- View active sites
+- Open sites
+- See views, size, files, project type
+- Extend expiration
+- Delete sites
 
 ## Render deploy
 
@@ -57,17 +117,22 @@ Required environment variables:
 ```env
 TELEGRAM_BOT_TOKEN=your_botfather_token
 PUBLIC_BASE_URL=https://your-service-name.onrender.com
+ADMIN_PASSWORD=your-strong-password
 ```
 
 Recommended environment variables:
 
 ```env
 LINK_TTL_MINUTES=60
-MAX_PROJECT_MB=50
+MAX_LINK_TTL_MINUTES=1440
+MAX_PROJECT_MB=80
+MAX_SINGLE_FILE_MB=25
 MAX_ZIP_ENTRIES=1000
 MAX_CONCURRENT_UPLOADS=2
 SPA_FALLBACK=true
 KEEP_FILES_ON_STARTUP=false
+ADMIN_USERNAME=admin
+ADMIN_PATH=/admin
 ```
 
 Optional private bot:
@@ -82,6 +147,7 @@ ALLOWED_USER_IDS=1272791365
 go mod tidy
 export TELEGRAM_BOT_TOKEN="YOUR_BOT_TOKEN"
 export PUBLIC_BASE_URL="http://localhost:8080"
+export ADMIN_PASSWORD="admin1234"
 go run .
 ```
 
@@ -89,26 +155,52 @@ Open:
 
 ```text
 http://localhost:8080
+http://localhost:8080/admin
 http://localhost:8080/healthz
 ```
 
-## Bot commands
+## ZIP Security Scanner
 
-- `/start`
-- `/help`
-- `/status`
+The scanner blocks:
 
-## Security features
+- Unsafe paths like `../`
+- Symlinks
+- PHP, Python, shell, EXE, DLL, SQL/db files
+- `.env`, private keys
+- `.git`, `node_modules`, cache folders
+- Too many files
+- Files too large
+- Project too large
+- Too-deep folders
 
-- Random token URL per hosted site
-- Auto-expire links
-- Auto-delete expired files
-- Blocks unsafe ZIP paths like `../`
-- Blocks symlinks in ZIP
-- Limits project size
-- Limits number of ZIP entries
-- Serves static files only
-- No server-side code execution
+## Auto Detect Project Type
+
+The bot checks common project folders:
+
+```text
+/
+dist/
+build/
+public/
+out/
+www/
+project-folder/dist/
+project-folder/build/
+```
+
+Then detects:
+
+```text
+Vite static build
+Vue static build
+Angular static build
+Next.js static export
+Nuxt static export
+Svelte static build
+Astro static build
+Tailwind static site
+HTML static site
+```
 
 ## Important limitation
 
