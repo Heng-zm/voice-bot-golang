@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -14,24 +16,32 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 type Config struct {
-	Token              string
-	YTDLPBin           string
-	DownloadDir        string
-	MaxFileMB          int64
-	MaxFileBytes       int64
-	DownloadTimeout    time.Duration
-	MaxConcurrentJobs  int
-	AllowedUsers       map[int64]bool
-	AllowPrivateURLs   bool
+	Token             string
+	YTDLPBin          string
+	CookiesFile       string
+	DownloadDir       string
+	MaxFileMB         int64
+	MaxFileBytes      int64
+	DownloadTimeout   time.Duration
+	MaxConcurrentJobs int
+	AllowedUsers      map[int64]bool
+	AllowPrivateURLs  bool
+	UserAgent         string
+	ForceIPv4         bool
 }
 
-var urlRegex = regexp.MustCompile(`https?://[^\s<>"']+`)
+var (
+	urlRegex         = regexp.MustCompile(`https?://[^\s<>"']+`)
+	activeDownloads int64
+	totalDownloads  int64
+)
 
 func main() {
 	cfg := loadConfig()
@@ -52,6 +62,16 @@ func main() {
 		log.Printf("warning: ffmpeg not found. Some videos may fail to merge/remux to mp4: %v", err)
 	}
 
+	if cfg.CookiesFile != "" {
+		if _, err := os.Stat(cfg.CookiesFile); err != nil {
+			log.Printf("warning: YTDLP_COOKIES_FILE is set but file does not exist: %s (%v)", cfg.CookiesFile, err)
+		} else {
+			log.Printf("yt-dlp cookies enabled: %s", cfg.CookiesFile)
+		}
+	}
+
+	startOptionalHealthServer()
+
 	bot, err := tgbotapi.NewBotAPI(cfg.Token)
 	if err != nil {
 		log.Fatalf("create Telegram bot failed: %v", err)
@@ -62,8 +82,8 @@ func main() {
 
 	updateConfig := tgbotapi.NewUpdate(0)
 	updateConfig.Timeout = 60
-	updates := bot.GetUpdatesChan(updateConfig)
 
+	updates := bot.GetUpdatesChan(updateConfig)
 	sem := make(chan struct{}, cfg.MaxConcurrentJobs)
 
 	for update := range updates {
@@ -72,6 +92,7 @@ func main() {
 		}
 
 		msg := update.Message
+
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -90,7 +111,6 @@ func loadConfig() Config {
 		maxFileMB = 48
 	}
 	if maxFileMB > 50 {
-		// Telegram Bot API upload limit for normal bot upload is 50 MB.
 		maxFileMB = 50
 	}
 
@@ -107,6 +127,7 @@ func loadConfig() Config {
 	return Config{
 		Token:             strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN")),
 		YTDLPBin:          envString("YTDLP_BIN", "yt-dlp"),
+		CookiesFile:       strings.TrimSpace(os.Getenv("YTDLP_COOKIES_FILE")),
 		DownloadDir:       envString("DOWNLOAD_DIR", "downloads"),
 		MaxFileMB:         maxFileMB,
 		MaxFileBytes:      maxFileMB * 1024 * 1024,
@@ -114,7 +135,45 @@ func loadConfig() Config {
 		MaxConcurrentJobs: maxConcurrent,
 		AllowedUsers:      parseAllowedUsers(os.Getenv("ALLOWED_USER_IDS")),
 		AllowPrivateURLs:  envBool("ALLOW_PRIVATE_URLS", false),
+		UserAgent:         envString("YTDLP_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"),
+		ForceIPv4:         envBool("YTDLP_FORCE_IPV4", true),
 	}
+}
+
+func startOptionalHealthServer() {
+	port := strings.TrimSpace(os.Getenv("PORT"))
+	if port == "" {
+		return
+	}
+
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ok\n")
+	})
+
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = fmt.Fprintf(
+			w,
+			"ok\nactive_downloads=%d\ntotal_downloads=%d\n",
+			atomic.LoadInt64(&activeDownloads),
+			atomic.LoadInt64(&totalDownloads),
+		)
+	})
+
+	server := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		log.Printf("health server listening on :%s", port)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("health server failed: %v", err)
+		}
+	}()
 }
 
 func handleMessage(bot *tgbotapi.BotAPI, cfg Config, sem chan struct{}, msg *tgbotapi.Message) {
@@ -130,6 +189,17 @@ func handleMessage(bot *tgbotapi.BotAPI, cfg Config, sem chan struct{}, msg *tgb
 
 	if strings.HasPrefix(text, "/start") || strings.HasPrefix(text, "/help") {
 		sendText(bot, chatID, helpText(cfg))
+		return
+	}
+
+	if strings.HasPrefix(text, "/status") {
+		sendText(bot, chatID, fmt.Sprintf(
+			"📊 Bot status\n\nActive downloads: %d\nTotal downloads: %d\nMax file: %dMB\nCookies: %s",
+			atomic.LoadInt64(&activeDownloads),
+			atomic.LoadInt64(&totalDownloads),
+			cfg.MaxFileMB,
+			yesNo(cfg.CookiesFile != ""),
+		))
 		return
 	}
 
@@ -150,7 +220,11 @@ func handleMessage(bot *tgbotapi.BotAPI, cfg Config, sem chan struct{}, msg *tgb
 	status, _ := bot.Send(tgbotapi.NewMessage(chatID, "⏳ Added to queue...\nកំពុងរង់ចាំ download slot..."))
 
 	sem <- struct{}{}
-	defer func() { <-sem }()
+	atomic.AddInt64(&activeDownloads, 1)
+	defer func() {
+		<-sem
+		atomic.AddInt64(&activeDownloads, -1)
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.DownloadTimeout)
 	defer cancel()
@@ -162,7 +236,7 @@ func handleMessage(bot *tgbotapi.BotAPI, cfg Config, sem chan struct{}, msg *tgb
 
 	_ = sendChatAction(bot, chatID, "upload_video")
 
-	title, videoPath, err := downloadVideo(ctx, cfg, link, msg.From.ID)
+	title, videoPath, err := downloadVideo(ctx, cfg, link, safeFromID(msg))
 	if err != nil {
 		editStatus(bot, chatID, status.MessageID, "❌ Download failed:\n"+truncate(err.Error(), 3500))
 		return
@@ -213,6 +287,7 @@ func handleMessage(bot *tgbotapi.BotAPI, cfg Config, sem chan struct{}, msg *tgb
 		}
 	}
 
+	atomic.AddInt64(&totalDownloads, 1)
 	editStatus(bot, chatID, status.MessageID, "✅ Done.")
 }
 
@@ -229,23 +304,60 @@ func downloadVideo(ctx context.Context, cfg Config, link string, userID int64) (
 		"--restrict-filenames",
 		"--no-warnings",
 		"--no-mtime",
+		"--retries", "3",
+		"--fragment-retries", "3",
+		"--retry-sleep", "exp=1:8",
+		"--sleep-requests", "1",
 		"--merge-output-format", "mp4",
 		"--remux-video", "mp4",
 		"-f", "bv*[height<=720]+ba/b[height<=720]/best[height<=720]/best",
 		"--max-filesize", fmt.Sprintf("%dM", cfg.MaxFileMB),
+		"--user-agent", cfg.UserAgent,
 		"-o", outputTemplate,
-		link,
 	}
+
+	if cfg.ForceIPv4 {
+		args = append(args, "--force-ipv4")
+	}
+
+	if cfg.CookiesFile != "" {
+		if _, err := os.Stat(cfg.CookiesFile); err != nil {
+			_ = os.RemoveAll(jobDir)
+			return "", "", fmt.Errorf("cookies file not found: %s. Error: %w", cfg.CookiesFile, err)
+		}
+
+		args = append(args, "--cookies", cfg.CookiesFile)
+	}
+
+	args = append(args, link)
 
 	cmd := exec.CommandContext(ctx, cfg.YTDLPBin, args...)
 	output, err := cmd.CombinedOutput()
+	outText := string(output)
+
 	if ctx.Err() != nil {
 		_ = os.RemoveAll(jobDir)
 		return "", "", fmt.Errorf("download timeout after %s", cfg.DownloadTimeout)
 	}
+
 	if err != nil {
 		_ = os.RemoveAll(jobDir)
-		return "", "", fmt.Errorf("yt-dlp error: %v\n%s", err, truncate(string(output), 3500))
+
+		if isYouTubeBotBlock(outText) {
+			if cfg.CookiesFile == "" {
+				return "", "", fmt.Errorf(
+					"YouTube blocked this server as bot traffic.\n\nFix: add YouTube cookies file on Render Secret Files and set:\nYTDLP_COOKIES_FILE=/etc/secrets/youtube_cookies.txt\n\nOriginal yt-dlp output:\n%s",
+					truncate(outText, 2800),
+				)
+			}
+
+			return "", "", fmt.Errorf(
+				"YouTube still blocked this request even with cookies. Your cookies may be expired or invalid. Export fresh cookies and update Render Secret File.\n\nOriginal yt-dlp output:\n%s",
+				truncate(outText, 2800),
+			)
+		}
+
+		return "", "", fmt.Errorf("yt-dlp error: %v\n%s", err, truncate(outText, 3500))
 	}
 
 	videoPath, err := findDownloadedVideo(jobDir)
@@ -258,13 +370,21 @@ func downloadVideo(ctx context.Context, cfg Config, link string, userID int64) (
 	return title, videoPath, nil
 }
 
+func isYouTubeBotBlock(s string) bool {
+	s = strings.ToLower(s)
+	return strings.Contains(s, "sign in to confirm") ||
+		strings.Contains(s, "not a bot") ||
+		strings.Contains(s, "use --cookies-from-browser") ||
+		strings.Contains(s, "use --cookies for the authentication")
+}
+
 func findDownloadedVideo(root string) (string, error) {
 	allowedExt := map[string]bool{
-		".mp4": true,
-		".m4v": true,
-		".mov": true,
+		".mp4":  true,
+		".m4v":  true,
+		".mov":  true,
 		".webm": true,
-		".mkv": true,
+		".mkv":  true,
 	}
 
 	var bestPath string
@@ -366,6 +486,10 @@ func helpText(cfg Config) string {
 2. Bot នឹង download video
 3. Bot ផ្ញើ video ត្រឡប់ទៅ Telegram
 
+Commands:
+/help - show help
+/status - show bot status
+
 Example:
 https://example.com/video
 
@@ -374,9 +498,17 @@ Limits:
 - Max quality: 720p
 - Playlist disabled
 - Public http/https URLs only
+- Cookies enabled: %s
+
+YouTube note:
+If YouTube says "Sign in to confirm you're not a bot", add cookies with:
+YTDLP_COOKIES_FILE=/etc/secrets/youtube_cookies.txt
 
 ចំណាំ:
-ប្រើសម្រាប់ video ដែលអ្នកមានសិទ្ធិ download ប៉ុណ្ណោះ។ Bot នេះមិន bypass DRM/private/paid content ទេ។`, cfg.MaxFileMB)
+ប្រើសម្រាប់ video ដែលអ្នកមានសិទ្ធិ download ប៉ុណ្ណោះ។ Bot នេះមិន bypass DRM/private/paid content ទេ។`,
+		cfg.MaxFileMB,
+		yesNo(cfg.CookiesFile != ""),
+	)
 }
 
 func sendText(bot *tgbotapi.BotAPI, chatID int64, text string) {
@@ -501,4 +633,18 @@ func parseAllowedUsers(raw string) map[int64]bool {
 	}
 
 	return result
+}
+
+func safeFromID(msg *tgbotapi.Message) int64 {
+	if msg != nil && msg.From != nil {
+		return msg.From.ID
+	}
+	return msg.Chat.ID
+}
+
+func yesNo(v bool) string {
+	if v {
+		return "yes"
+	}
+	return "no"
 }
