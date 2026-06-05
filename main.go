@@ -272,7 +272,6 @@ func loadConfig() Config {
 	}
 
 	adminPath := sanitizeAdminPath(envString("ADMIN_PATH", "/admin"))
-
 	adminUsername := envString("ADMIN_USERNAME", "admin")
 
 	return Config{
@@ -674,6 +673,26 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, cfg Config, cq *tgbotapi.Callback
 	case data == "password:cancel":
 		users.SetAwaitingPassword(userID, false)
 		sendPasswordPanel(bot, chatID, userID)
+	case data == "domains:list":
+		if !isAdminUser(cfg, userID) {
+			sendUserOnlyPanel(bot, cfg, chatID, userID)
+			return
+		}
+		sendDomainsPanel(bot, cfg, chatID, userID)
+	case data == "domain:cancel":
+		users.SetAwaitingDomain(userID, "")
+		sendDomainsPanel(bot, cfg, chatID, userID)
+	case strings.HasPrefix(data, "domain:add:"):
+		token := strings.TrimPrefix(data, "domain:add:")
+		if !isAdminUser(cfg, userID) {
+			sendUserOnlyPanel(bot, cfg, chatID, userID)
+			return
+		}
+		users.SetAwaitingDomain(userID, token)
+		sendWithButtons(bot, chatID,
+			"🌍 *Add custom domain*\n\nSend the domain name (e.g., `mybrand.com` or `sub.domain.com`) as your next message\\.\n\nMake sure it is pointed to our servers via CNAME\\.",
+			domainInputKeyboard(),
+		)
 	case strings.HasPrefix(data, "site:delete:"):
 		token := strings.TrimPrefix(data, "site:delete:")
 		if token == "" {
@@ -1700,14 +1719,14 @@ func handleAdmin(w http.ResponseWriter, r *http.Request, cfg Config) {
 		return
 	}
 
-	path := strings.TrimPrefix(r.URL.Path, cfg.AdminPath)
-	if path == "" || path == "/" {
+	pathVal := strings.TrimPrefix(r.URL.Path, cfg.AdminPath)
+	if pathVal == "" || pathVal == "/" {
 		writeAdminDashboard(w, cfg)
 		return
 	}
 
-	if strings.HasPrefix(path, "/delete/") {
-		token := strings.TrimPrefix(path, "/delete/")
+	if strings.HasPrefix(pathVal, "/delete/") {
+		token := strings.TrimPrefix(pathVal, "/delete/")
 		if token != "" {
 			if site, ok := store.Get(token); ok {
 				store.Delete(token)
@@ -1718,8 +1737,8 @@ func handleAdmin(w http.ResponseWriter, r *http.Request, cfg Config) {
 		return
 	}
 
-	if strings.HasPrefix(path, "/extend/") {
-		token := strings.TrimPrefix(path, "/extend/")
+	if strings.HasPrefix(pathVal, "/extend/") {
+		token := strings.TrimPrefix(pathVal, "/extend/")
 		if token != "" {
 			if site, ok := store.Get(token); ok {
 				// Add the default TTL on top of current expiry, capped at MaxTTL from creation
@@ -2040,7 +2059,7 @@ func handleSiteLogin(w http.ResponseWriter, r *http.Request, cfg Config, site Ho
 	cookie := &http.Cookie{
 		Name:     "site_auth_" + site.Token,
 		Value:    authCookieValue(site, cfg.CookieSecret),
-		Path:     "/s/" + site.Token + "/",
+		Path:     authCookiePath(r, site.Token),
 		Expires:  site.ExpiresAt,
 		MaxAge:   int(time.Until(site.ExpiresAt).Seconds()),
 		HttpOnly: true,
@@ -2049,7 +2068,12 @@ func handleSiteLogin(w http.ResponseWriter, r *http.Request, cfg Config, site Ho
 	}
 
 	http.SetCookie(w, cookie)
-	http.Redirect(w, r, "/s/"+site.Token+"/", http.StatusSeeOther)
+	
+	redirectPath := "/s/" + site.Token + "/"
+	if _, ok := domains.TokenForHost(r.Host); ok {
+		redirectPath = "/"
+	}
+	http.Redirect(w, r, redirectPath, http.StatusSeeOther)
 }
 
 func isPasswordAuthed(r *http.Request, cfg Config, site HostedSite) bool {
@@ -2064,6 +2088,13 @@ func isPasswordAuthed(r *http.Request, cfg Config, site HostedSite) bool {
 func authCookieValue(site HostedSite, secret string) string {
 	sum := sha256.Sum256([]byte(secret + ":" + site.Token + ":" + site.PasswordHash + ":" + site.PasswordSalt))
 	return hex.EncodeToString(sum[:])
+}
+
+func authCookiePath(r *http.Request, token string) string {
+	if _, ok := domains.TokenForHost(r.Host); ok {
+		return "/"
+	}
+	return "/s/" + token + "/"
 }
 
 func requestIsHTTPS(r *http.Request) bool {
@@ -2241,26 +2272,11 @@ func shouldCountView(r *http.Request, target string) bool {
 	return ext == ".html" || ext == ".htm"
 }
 
-func setStaticHeaders(w http.ResponseWriter, path string, site HostedSite) {
-	ext := strings.ToLower(filepath.Ext(path))
+func setStaticHeaders(w http.ResponseWriter, pathValue string, site HostedSite) {
+	ext := strings.ToLower(filepath.Ext(pathValue))
 	contentType := mime.TypeByExtension(ext)
 	if contentType == "" {
-		switch ext {
-		case ".html", ".htm":
-			contentType = "text/html; charset=utf-8"
-		case ".css":
-			contentType = "text/css; charset=utf-8"
-		case ".js", ".mjs":
-			contentType = "text/javascript; charset=utf-8"
-		case ".json":
-			contentType = "application/json; charset=utf-8"
-		case ".svg":
-			contentType = "image/svg+xml"
-		case ".wasm":
-			contentType = "application/wasm"
-		default:
-			contentType = "application/octet-stream"
-		}
+		contentType = contentTypeForPath(pathValue)
 	}
 	w.Header().Set("Content-Type", contentType)
 	if ext == ".html" || ext == ".htm" {
@@ -2415,8 +2431,6 @@ func (u *UserStore) SetAwaitingDomain(userID int64, token string) {
 // Telegram helpers
 // ─────────────────────────────────────────────
 
-// sendMD sends a MarkdownV2-formatted message and falls back to plain text
-// if Telegram rejects the Markdown. This prevents parse errors from breaking UX.
 func sendMD(bot *tgbotapi.BotAPI, chatID int64, text string) {
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = tgbotapi.ModeMarkdownV2
@@ -2431,7 +2445,6 @@ func sendMD(bot *tgbotapi.BotAPI, chatID int64, text string) {
 	}
 }
 
-// sendWithButtons sends a MarkdownV2 message with inline keyboard and plain-text fallback.
 func sendWithButtons(bot *tgbotapi.BotAPI, chatID int64, text string, buttons [][]tgbotapi.InlineKeyboardButton) {
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = tgbotapi.ModeMarkdownV2
@@ -2447,7 +2460,6 @@ func sendWithButtons(bot *tgbotapi.BotAPI, chatID int64, text string, buttons []
 	}
 }
 
-// editMD edits an existing message with MarkdownV2 text and ignores harmless duplicate edits.
 func editMD(bot *tgbotapi.BotAPI, chatID int64, messageID int, text string) {
 	if messageID == 0 {
 		return
@@ -2468,7 +2480,6 @@ func editMD(bot *tgbotapi.BotAPI, chatID int64, messageID int, text string) {
 	}
 }
 
-// editMsgWithButtons edits an existing message with MarkdownV2 text and inline keyboard.
 func editMsgWithButtons(bot *tgbotapi.BotAPI, chatID int64, messageID int, text string, buttons [][]tgbotapi.InlineKeyboardButton) {
 	if messageID == 0 {
 		return
@@ -2504,9 +2515,7 @@ func plainFromMarkdownV2(s string) string {
 	return replacer.Replace(s)
 }
 
-// escapeMarkdownV2 escapes all special characters required by Telegram MarkdownV2.
 func escapeMarkdownV2(s string) string {
-	// Characters that must be escaped in MarkdownV2 outside of code/pre spans
 	special := `\_*[]()~` + "`" + `>#+-=|{}.!`
 	var b strings.Builder
 	b.Grow(len(s) + 8)
@@ -2569,8 +2578,8 @@ func isInsideBase(base string, target string) bool {
 	return rel == "." || (!strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != "..")
 }
 
-func fileExists(path string) bool {
-	info, err := os.Stat(path)
+func fileExists(pathValue string) bool {
+	info, err := os.Stat(pathValue)
 	return err == nil && !info.IsDir()
 }
 
@@ -2900,15 +2909,25 @@ func (r *R2Storage) GetFile(ctx context.Context, token string, relPath string) (
 	if err != nil {
 		return nil, err
 	}
+	key := r.objectKey(token, cleanRel)
 	out, err := r.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(r.bucket),
-		Key:    aws.String(r.objectKey(token, cleanRel)),
+		Key:    aws.String(key),
 	})
 	if err != nil {
-		return nil, err
+		// Attempt directory level index file lookup if original remote get failed
+		fallbackKey := r.objectKey(token, path.Join(cleanRel, "index.html"))
+		out, err = r.client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(r.bucket),
+			Key:    aws.String(fallbackKey),
+		})
+		if err != nil {
+			return nil, err
+		}
+		cleanRel = path.Join(cleanRel, "index.html")
 	}
 	defer out.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(out.Body, 512*1024*1024))
+	body, err := io.ReadAll(io.LimitReader(out.Body, 100*1024*1024))
 	if err != nil {
 		return nil, err
 	}
@@ -2923,7 +2942,8 @@ func (r *R2Storage) GetFile(ctx context.Context, token string, relPath string) (
 }
 
 func (r *R2Storage) DeleteSite(ctx context.Context, token string) error {
-	prefix := r.objectKey(token, "")
+	// A trailing slash guarantees listing prefix is fully isolated to token folder
+	prefix := r.objectKey(token, "") + "/"
 	var continuation *string
 	for {
 		out, err := r.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
@@ -3048,7 +3068,6 @@ func (c *SupabaseClient) UpsertUser(ctx context.Context, row map[string]any) err
 }
 
 func (c *SupabaseClient) IncrementUserUploadCount(ctx context.Context, userID int64) {
-	// Keep this lightweight and non-fatal. Exact counters can also be computed from upload_logs.
 	patch := map[string]any{"last_upload_at": time.Now().UTC().Format(time.RFC3339)}
 	_, err := c.request(ctx, http.MethodPatch, "bot_users?user_id=eq."+strconv.FormatInt(userID, 10), patch)
 	if err != nil {
@@ -3348,8 +3367,10 @@ func handleDomainInput(bot *tgbotapi.BotAPI, cfg Config, chatID, userID int64, t
 
 func domainInputKeyboard() [][]tgbotapi.InlineKeyboardButton {
 	return [][]tgbotapi.InlineKeyboardButton{
-		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("❌ Cancel", "domain:cancel")),
-		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("🏠 Home", "menu:home")),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("❌ Cancel", "domain:cancel")),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🏠 Home", "menu:home")),
 	}
 }
 
@@ -3370,7 +3391,10 @@ func sendDomainsPanel(bot *tgbotapi.BotAPI, cfg Config, chatID, userID int64) {
 		b.WriteString(fmt.Sprintf("*%d\\.* `%s` → `%s`\n", i+1, escapeMarkdownV2(m.Domain), escapeMarkdownV2(m.Token)))
 	}
 	sendWithButtons(bot, chatID, b.String(), [][]tgbotapi.InlineKeyboardButton{
-		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "domains:list"), tgbotapi.NewInlineKeyboardButtonData("🌐 My Sites", "sites:list")),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "domains:list"), 
+			tgbotapi.NewInlineKeyboardButtonData("🌐 My Sites", "sites:list"),
+		),
 		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("🏠 Home", "menu:home")),
 	})
 }
@@ -3407,6 +3431,11 @@ func normalizeDomainInput(input string) (string, error) {
 
 func normalizeHost(host string) string {
 	host = strings.TrimSpace(strings.ToLower(host))
+	if strings.Contains(host, "://") {
+		if u, err := url.Parse(host); err == nil {
+			host = u.Host
+		}
+	}
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
@@ -3477,6 +3506,36 @@ func contentTypeForPath(pathValue string) string {
 		return "image/svg+xml"
 	case ".wasm":
 		return "application/wasm"
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".ico":
+		return "image/x-icon"
+	case ".woff":
+		return "font/woff"
+	case ".woff2":
+		return "font/woff2"
+	case ".ttf":
+		return "font/ttf"
+	case ".otf":
+		return "font/otf"
+	case ".txt":
+		return "text/plain; charset=utf-8"
+	case ".xml":
+		return "application/xml; charset=utf-8"
+	case ".mp3":
+		return "audio/mpeg"
+	case ".mp4":
+		return "video/mp4"
+	case ".webm":
+		return "video/webm"
+	case ".pdf":
+		return "application/pdf"
 	default:
 		return "application/octet-stream"
 	}
@@ -3626,9 +3685,6 @@ func usernameFromMessage(msg *tgbotapi.Message) string {
 	return name
 }
 
-// isAdminUser returns true only when userID is explicitly listed in ADMIN_USER_IDS.
-// IMPORTANT: ALLOWED_USER_IDS only controls who can use/upload with the bot.
-// It does not grant admin permissions.
 func isAdminUser(cfg Config, userID int64) bool {
 	if cfg.AdminUserIDs == nil {
 		return false
