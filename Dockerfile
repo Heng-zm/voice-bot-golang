@@ -1,11 +1,12 @@
 FROM golang:1.22-bookworm AS build
 
 WORKDIR /src
+
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/app .
+RUN CGO_ENABLED=0 GOOS=linux go build -tags netgo -trimpath -ldflags="-s -w" -o /out/app .
 
 FROM python:3.12-slim
 
@@ -15,6 +16,7 @@ RUN apt-get update \
     && python -m pip install --no-cache-dir -U "yt-dlp[default]"
 
 WORKDIR /app
+
 COPY --from=build /out/app /app/app
 
 RUN mkdir -p /app/downloads
