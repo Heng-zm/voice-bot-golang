@@ -74,7 +74,8 @@ type HostedSite struct {
 }
 
 type UserSettings struct {
-	NextPassword string
+	NextPassword     string
+	AwaitingPassword bool
 }
 
 type SiteStore struct {
@@ -298,14 +299,17 @@ func handleMessage(bot *tgbotapi.BotAPI, cfg Config, sem chan struct{}, msg *tgb
 	cmd := firstCommand(text)
 
 	switch cmd {
-	case "/start", "/help":
-		sendMD(bot, chatID, helpText(cfg))
+	case "/start":
+		sendHomePanel(bot, cfg, chatID, userID)
+		return
+	case "/help":
+		sendHelpPanel(bot, cfg, chatID)
 		return
 	case "/status":
-		sendMD(bot, chatID, statusText(cfg))
+		sendStatusPanel(bot, cfg, chatID)
 		return
 	case "/my_sites":
-		sendMD(bot, chatID, mySitesText(cfg, userID))
+		sendMySitesPanel(bot, cfg, chatID, userID)
 		return
 	case "/delete_site":
 		handleDeleteSiteCommand(bot, cfg, chatID, userID, text)
@@ -318,21 +322,14 @@ func handleMessage(bot *tgbotapi.BotAPI, cfg Config, sem chan struct{}, msg *tgb
 		return
 	}
 
-	// No document and no recognized command
+	if msg.Document == nil && users.Get(userID).AwaitingPassword && cmd == "" {
+		handlePasswordInput(bot, cfg, chatID, userID, text)
+		return
+	}
+
+	// No document and no recognized command: show the button-first home panel.
 	if msg.Document == nil {
-		sendWithButtons(bot, chatID,
-			"📦 *Send me your static website project*\n\nUpload a `.zip` file that contains `index.html`, or a single `.html` file.",
-			[][]tgbotapi.InlineKeyboardButton{
-				tgbotapi.NewInlineKeyboardRow(
-					tgbotapi.NewInlineKeyboardButtonData("📖 Help", "/help"),
-					tgbotapi.NewInlineKeyboardButtonData("📊 Status", "/status"),
-				),
-				tgbotapi.NewInlineKeyboardRow(
-					tgbotapi.NewInlineKeyboardButtonData("🌐 My Sites", "/my_sites"),
-					tgbotapi.NewInlineKeyboardButtonData("🔐 Password", "/password"),
-				),
-			},
-		)
+		sendHomePanel(bot, cfg, chatID, userID)
 		return
 	}
 
@@ -499,11 +496,11 @@ func handleMessage(bot *tgbotapi.BotAPI, cfg Config, sem chan struct{}, msg *tgb
 				tgbotapi.NewInlineKeyboardButtonURL("🌐 Open Website", publicURL),
 			),
 			tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData("🗑 Delete Site", "/delete_site "+token),
-				tgbotapi.NewInlineKeyboardButtonData("⏰ Extend +60m", "/extend_site "+token+" 60"),
+				tgbotapi.NewInlineKeyboardButtonData("🗑 Delete Site", "site:delete:"+token),
+				tgbotapi.NewInlineKeyboardButtonData("⏰ Extend +60m", "site:extend:"+token+":60"),
 			),
 			tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData("🌐 My Sites", "/my_sites"),
+				tgbotapi.NewInlineKeyboardButtonData("🌐 My Sites", "sites:list"),
 			),
 		},
 	)
@@ -535,7 +532,7 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, cfg Config, cq *tgbotapi.Callback
 	}
 
 	chatID := cq.Message.Chat.ID
-	userID := cq.From.ID
+	userID := int64(cq.From.ID)
 	data := strings.TrimSpace(cq.Data)
 
 	if cfg.AllowedUsers != nil && !cfg.AllowedUsers[userID] {
@@ -544,24 +541,323 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, cfg Config, cq *tgbotapi.Callback
 	}
 
 	switch {
-	case data == "/help":
-		sendMD(bot, chatID, helpText(cfg))
-	case data == "/status":
-		sendMD(bot, chatID, statusText(cfg))
-	case data == "/my_sites":
-		sendMD(bot, chatID, mySitesText(cfg, int64(userID)))
-	case data == "/password":
-		current := users.Get(int64(userID))
-		if current.NextPassword == "" {
-			sendMD(bot, chatID, "🔐 *Password protection is OFF*\n\nSend `/password 1234` to protect your next upload.\nSend `/password off` to disable.")
-		} else {
-			sendMD(bot, chatID, "🔐 *Password protection is ON*\n\nYour next upload will be password protected.\nSend `/password off` to disable.")
+	case data == "menu:home":
+		sendHomePanel(bot, cfg, chatID, userID)
+	case data == "upload:guide":
+		sendUploadGuidePanel(bot, cfg, chatID)
+	case data == "help:show":
+		sendHelpPanel(bot, cfg, chatID)
+	case data == "status:show":
+		sendStatusPanel(bot, cfg, chatID)
+	case data == "sites:list", data == "sites:refresh":
+		sendMySitesPanel(bot, cfg, chatID, userID)
+	case data == "password:menu":
+		sendPasswordPanel(bot, chatID, userID)
+	case data == "password:set":
+		users.SetAwaitingPassword(userID, true)
+		sendWithButtons(bot, chatID,
+			"🔐 *Set password for next upload*\n\nSend the password as your next message\\.\n\nUse 4\\-64 characters\\. The next uploaded website will require this password\\.",
+			[][]tgbotapi.InlineKeyboardButton{
+				tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonData("❌ Cancel", "password:cancel"),
+					tgbotapi.NewInlineKeyboardButtonData("🔓 Turn Off", "password:off"),
+				),
+				tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("🏠 Home", "menu:home")),
+			},
+		)
+	case data == "password:off":
+		users.SetPassword(userID, "")
+		sendWithButtons(bot, chatID,
+			"✅ *Password protection disabled*\n\nYour next uploads will be public\\.",
+			passwordKeyboard(),
+		)
+	case data == "password:cancel":
+		users.SetAwaitingPassword(userID, false)
+		sendPasswordPanel(bot, chatID, userID)
+	case strings.HasPrefix(data, "site:delete:"):
+		token := strings.TrimPrefix(data, "site:delete:")
+		if token == "" {
+			sendMD(bot, chatID, "❌ Site token is missing\\.")
+			return
 		}
-	case strings.HasPrefix(data, "/delete_site "):
-		handleDeleteSiteCommand(bot, cfg, chatID, int64(userID), data)
-	case strings.HasPrefix(data, "/extend_site "):
-		handleExtendSiteCommand(bot, cfg, chatID, int64(userID), data)
+		sendWithButtons(bot, chatID,
+			fmt.Sprintf("⚠️ *Delete this site?*\n\nToken: `%s`\n\nThis cannot be undone\\.", escapeMarkdownV2(token)),
+			[][]tgbotapi.InlineKeyboardButton{
+				tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonData("✅ Yes, Delete", "site:delete_confirm:"+token),
+					tgbotapi.NewInlineKeyboardButtonData("❌ Cancel", "sites:list"),
+				),
+				tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("🌐 My Sites", "sites:list")),
+			},
+		)
+	case strings.HasPrefix(data, "site:delete_confirm:"):
+		token := strings.TrimPrefix(data, "site:delete_confirm:")
+		deleteSiteByButton(bot, cfg, chatID, userID, token)
+	case strings.HasPrefix(data, "site:extend:"):
+		token, minutes, ok := parseExtendCallback(data)
+		if !ok {
+			sendMD(bot, chatID, "❌ Invalid extend action\\.")
+			return
+		}
+		extendSiteByButton(bot, cfg, chatID, userID, token, minutes)
+	default:
+		sendHomePanel(bot, cfg, chatID, userID)
 	}
+}
+
+// ─────────────────────────────────────────────
+// Button-first interface panels
+// ─────────────────────────────────────────────
+
+func sendHomePanel(bot *tgbotapi.BotAPI, cfg Config, chatID, userID int64) {
+	settings := users.Get(userID)
+	passwordStatus := "OFF"
+	if settings.NextPassword != "" {
+		passwordStatus = "ON ✅"
+	}
+	if settings.AwaitingPassword {
+		passwordStatus = "WAITING FOR PASSWORD"
+	}
+
+	text := fmt.Sprintf(
+		"🏠 *Home Panel*\n\n"+
+			"Use the buttons below to manage temporary static website hosting\\.\n\n"+
+			"📤 Upload: send `.zip` or `.html`\n"+
+			"🔐 Password: *%s*\n"+
+			"🌐 Active sites: *%d*\n\n"+
+			"Tap *Upload Guide* before sending your project\\.",
+		escapeMarkdownV2(passwordStatus),
+		len(store.ByUser(userID)),
+	)
+
+	sendWithButtons(bot, chatID, text, mainMenuKeyboard(cfg))
+}
+
+func sendUploadGuidePanel(bot *tgbotapi.BotAPI, cfg Config, chatID int64) {
+	text := fmt.Sprintf(
+		"📤 *Upload Guide*\n\n"+
+			"1\\. Prepare a static website project as `.zip`, or send one `.html` file\\.\n"+
+			"2\\. The project must include `index.html`\\.\n"+
+			"3\\. Send the file directly in this chat\\. No command is needed\\.\n"+
+			"4\\. After upload, the bot gives you buttons to open, extend, or delete the website\\.\n\n"+
+			"*Limits*\n"+
+			"• Max project: `%d MB`\n"+
+			"• Max single file: `%d MB`\n"+
+			"• Link TTL: `%s`",
+		cfg.MaxProjectMB,
+		cfg.MaxSingleFileMB,
+		escapeMarkdownV2(humanDuration(cfg.LinkTTL)),
+	)
+
+	sendWithButtons(bot, chatID, text, [][]tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔐 Password", "password:menu"),
+			tgbotapi.NewInlineKeyboardButtonData("🌐 My Sites", "sites:list"),
+		),
+		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("🏠 Home", "menu:home")),
+	})
+}
+
+func sendHelpPanel(bot *tgbotapi.BotAPI, cfg Config, chatID int64) {
+	sendWithButtons(bot, chatID, helpText(cfg), mainMenuKeyboard(cfg))
+}
+
+func sendStatusPanel(bot *tgbotapi.BotAPI, cfg Config, chatID int64) {
+	sendWithButtons(bot, chatID, statusText(cfg), [][]tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "status:show"),
+			tgbotapi.NewInlineKeyboardButtonData("🌐 My Sites", "sites:list"),
+		),
+		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("🏠 Home", "menu:home")),
+	})
+}
+
+func sendPasswordPanel(bot *tgbotapi.BotAPI, chatID, userID int64) {
+	settings := users.Get(userID)
+	status := "OFF"
+	detail := "Your next uploaded websites will be public\\."
+	if settings.NextPassword != "" {
+		status = "ON ✅"
+		detail = "Your next uploaded website will require a password\\."
+	}
+	if settings.AwaitingPassword {
+		status = "WAITING FOR PASSWORD"
+		detail = "Send the password as your next message, or tap Cancel\\."
+	}
+
+	text := fmt.Sprintf(
+		"🔐 *Password Protection*\n\n"+
+			"Status: *%s*\n"+
+			"%s\n\n"+
+			"Use the buttons below\\. No command is needed\\.",
+		escapeMarkdownV2(status),
+		detail,
+	)
+
+	sendWithButtons(bot, chatID, text, passwordKeyboard())
+}
+
+func sendMySitesPanel(bot *tgbotapi.BotAPI, cfg Config, chatID, userID int64) {
+	sites := store.ByUser(userID)
+	sendWithButtons(bot, chatID, mySitesText(cfg, userID), sitesKeyboard(cfg, sites))
+}
+
+func mainMenuKeyboard(cfg Config) [][]tgbotapi.InlineKeyboardButton {
+	rows := [][]tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📤 Upload Guide", "upload:guide"),
+			tgbotapi.NewInlineKeyboardButtonData("🌐 My Sites", "sites:list"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔐 Password", "password:menu"),
+			tgbotapi.NewInlineKeyboardButtonData("📊 Status", "status:show"),
+		),
+		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("📖 Help", "help:show")),
+	}
+	if cfg.AdminPassword != "" && cfg.PublicBaseURL != "" {
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonURL("🛠 Admin Dashboard", cfg.PublicBaseURL+cfg.AdminPath),
+		))
+	}
+	return rows
+}
+
+func passwordKeyboard() [][]tgbotapi.InlineKeyboardButton {
+	return [][]tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("✍️ Set Password", "password:set"),
+			tgbotapi.NewInlineKeyboardButtonData("🔓 Turn Off", "password:off"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("❌ Cancel Input", "password:cancel"),
+			tgbotapi.NewInlineKeyboardButtonData("🏠 Home", "menu:home"),
+		),
+	}
+}
+
+func sitesKeyboard(cfg Config, sites []HostedSite) [][]tgbotapi.InlineKeyboardButton {
+	rows := make([][]tgbotapi.InlineKeyboardButton, 0, min(len(sites)*2+2, 24))
+	sorted := append([]HostedSite(nil), sites...)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].CreatedAt.After(sorted[j].CreatedAt)
+	})
+
+	for i, s := range sorted {
+		if i >= 10 {
+			break
+		}
+		url := cfg.PublicBaseURL + "/s/" + s.Token + "/"
+		rows = append(rows,
+			tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonURL(fmt.Sprintf("🌐 Open #%d", i+1), url)),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("⏰ Extend #%d +60m", i+1), "site:extend:"+s.Token+":60"),
+				tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("🗑 Delete #%d", i+1), "site:delete:"+s.Token),
+			),
+		)
+	}
+
+	rows = append(rows,
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "sites:refresh"),
+			tgbotapi.NewInlineKeyboardButtonData("📤 Upload Guide", "upload:guide"),
+		),
+		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("🏠 Home", "menu:home")),
+	)
+	return rows
+}
+
+func handlePasswordInput(bot *tgbotapi.BotAPI, cfg Config, chatID, userID int64, text string) {
+	password := strings.TrimSpace(text)
+	if password == "" {
+		sendWithButtons(bot, chatID, "❌ *Password is empty*\n\nSend 4\\-64 characters, or tap Cancel\\.", passwordKeyboard())
+		return
+	}
+	if len(password) < 4 {
+		sendWithButtons(bot, chatID, "❌ *Password too short*\n\nUse at least 4 characters\\.", passwordKeyboard())
+		return
+	}
+	if len(password) > 64 {
+		sendWithButtons(bot, chatID, "❌ *Password too long*\n\nUse 64 characters or fewer\\.", passwordKeyboard())
+		return
+	}
+
+	users.SetPassword(userID, password)
+	sendWithButtons(bot, chatID,
+		"✅ *Password saved*\n\nYour next uploaded website will require this password\\.\n\nNow send your `.zip` or `.html` file when ready\\.",
+		[][]tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("📤 Upload Guide", "upload:guide"),
+				tgbotapi.NewInlineKeyboardButtonData("🔐 Password", "password:menu"),
+			),
+			tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("🏠 Home", "menu:home")),
+		},
+	)
+}
+
+func parseExtendCallback(data string) (string, int, bool) {
+	parts := strings.Split(data, ":")
+	if len(parts) != 4 || parts[0] != "site" || parts[1] != "extend" {
+		return "", 0, false
+	}
+	minutes, err := strconv.Atoi(parts[3])
+	if err != nil || minutes < 1 {
+		return "", 0, false
+	}
+	return parts[2], minutes, true
+}
+
+func deleteSiteByButton(bot *tgbotapi.BotAPI, cfg Config, chatID, userID int64, token string) {
+	site, ok := store.Get(token)
+	if !ok {
+		sendWithButtons(bot, chatID, "❌ *Site not found*\n\nIt may already be expired or deleted\\.", sitesKeyboard(cfg, store.ByUser(userID)))
+		return
+	}
+	if site.UploadedBy != userID && !isAdminUser(cfg, userID) {
+		sendWithButtons(bot, chatID, "⛔ *Not allowed*\n\nYou can only delete your own sites\\.", sitesKeyboard(cfg, store.ByUser(userID)))
+		return
+	}
+	store.Delete(token)
+	if err := os.RemoveAll(site.BaseDir); err != nil {
+		log.Printf("delete site files failed token=%s dir=%s: %v", token, site.BaseDir, err)
+	}
+	sendWithButtons(bot, chatID,
+		fmt.Sprintf("✅ *Site deleted*\n\nToken: `%s`", escapeMarkdownV2(token)),
+		sitesKeyboard(cfg, store.ByUser(userID)),
+	)
+}
+
+func extendSiteByButton(bot *tgbotapi.BotAPI, cfg Config, chatID, userID int64, token string, minutes int) {
+	site, ok := store.Get(token)
+	if !ok {
+		sendWithButtons(bot, chatID, "❌ *Site not found*\n\nIt may already be expired or deleted\\.", sitesKeyboard(cfg, store.ByUser(userID)))
+		return
+	}
+	if site.UploadedBy != userID && !isAdminUser(cfg, userID) {
+		sendWithButtons(bot, chatID, "⛔ *Not allowed*\n\nYou can only extend your own sites\\.", sitesKeyboard(cfg, store.ByUser(userID)))
+		return
+	}
+
+	newExpiry := site.ExpiresAt.Add(time.Duration(minutes) * time.Minute)
+	maxExpiry := site.CreatedAt.Add(cfg.MaxTTL)
+	capped := false
+	if newExpiry.After(maxExpiry) {
+		newExpiry = maxExpiry
+		capped = true
+	}
+	if !newExpiry.After(site.ExpiresAt) {
+		capped = true
+	}
+	site.ExpiresAt = newExpiry
+	store.Update(site)
+
+	capNote := ""
+	if capped {
+		capNote = "\n⚠️ Capped at maximum allowed TTL\\."
+	}
+	sendWithButtons(bot, chatID,
+		fmt.Sprintf("✅ *Site extended*\n\nToken: `%s`\nExpires in: *%s*%s", escapeMarkdownV2(token), escapeMarkdownV2(humanDuration(time.Until(site.ExpiresAt))), capNote),
+		sitesKeyboard(cfg, store.ByUser(userID)),
+	)
 }
 
 // ─────────────────────────────────────────────
@@ -572,39 +868,37 @@ func handlePasswordCommand(bot *tgbotapi.BotAPI, chatID, userID int64, text stri
 	args := strings.TrimSpace(strings.TrimPrefix(text, "/password"))
 
 	if args == "" {
-		current := users.Get(userID)
-		if current.NextPassword == "" {
-			sendMD(bot, chatID, "🔐 *Password protection*\n\nStatus: OFF\n\nCommands:\n• `/password 1234` — protect next upload\n• `/password off` — disable protection")
-		} else {
-			sendMD(bot, chatID, "🔐 *Password protection*\n\nStatus: ON ✅\n\nYour next upload will require a password.\n\n• `/password off` — disable protection")
-		}
+		sendPasswordPanel(bot, chatID, userID)
 		return
 	}
 
 	if strings.EqualFold(args, "off") || strings.EqualFold(args, "none") || strings.EqualFold(args, "disable") {
 		users.SetPassword(userID, "")
-		sendMD(bot, chatID, "✅ *Password protection disabled*\n\nYour next uploads will be public.")
+		sendWithButtons(bot, chatID, "✅ *Password protection disabled*\n\nYour next uploads will be public\\.", passwordKeyboard())
 		return
 	}
 
 	if len(args) < 4 {
-		sendMD(bot, chatID, "❌ Password too short. Use at least 4 characters.")
+		sendWithButtons(bot, chatID, "❌ *Password too short*\n\nUse at least 4 characters\\.", passwordKeyboard())
 		return
 	}
 
 	if len(args) > 64 {
-		sendMD(bot, chatID, "❌ Password too long. Max 64 characters.")
+		sendWithButtons(bot, chatID, "❌ *Password too long*\n\nUse 64 characters or fewer\\.", passwordKeyboard())
 		return
 	}
 
 	users.SetPassword(userID, args)
-	sendMD(bot, chatID, "✅ *Password protection enabled*\n\nYour next uploaded website will require a password to view.\n\nTo disable: `/password off`")
+	sendWithButtons(bot, chatID,
+		"✅ *Password protection enabled*\n\nYour next uploaded website will require a password\\. You can manage this with the buttons below\\.",
+		passwordKeyboard(),
+	)
 }
 
 func handleDeleteSiteCommand(bot *tgbotapi.BotAPI, cfg Config, chatID, userID int64, text string) {
 	fields := strings.Fields(text)
 	if len(fields) < 2 {
-		sendMD(bot, chatID, "ℹ️ *Usage:* `/delete_site TOKEN`\n\nUse /my\\_sites to see your site tokens.")
+		sendWithButtons(bot, chatID, "ℹ️ *Choose a site to delete*\n\nOpen *My Sites* and tap the delete button beside the website\\.", sitesKeyboard(cfg, store.ByUser(userID)))
 		return
 	}
 
@@ -622,20 +916,20 @@ func handleDeleteSiteCommand(bot *tgbotapi.BotAPI, cfg Config, chatID, userID in
 
 	store.Delete(token)
 	_ = os.RemoveAll(site.BaseDir)
-	sendMD(bot, chatID, fmt.Sprintf("✅ *Site deleted*\n\nToken: `%s`", escapeMarkdownV2(token)))
+	sendWithButtons(bot, chatID, fmt.Sprintf("✅ *Site deleted*\n\nToken: `%s`", escapeMarkdownV2(token)), sitesKeyboard(cfg, store.ByUser(userID)))
 }
 
 func handleExtendSiteCommand(bot *tgbotapi.BotAPI, cfg Config, chatID, userID int64, text string) {
 	fields := strings.Fields(text)
 	if len(fields) < 3 {
-		sendMD(bot, chatID, "ℹ️ *Usage:* `/extend_site TOKEN MINUTES`\n\nExample: `/extend_site abc123 60`")
+		sendWithButtons(bot, chatID, "ℹ️ *Choose a site to extend*\n\nOpen *My Sites* and tap the extend button beside the website\\.", sitesKeyboard(cfg, store.ByUser(userID)))
 		return
 	}
 
 	token := fields[1]
 	minutes, err := strconv.Atoi(fields[2])
 	if err != nil || minutes < 1 {
-		sendMD(bot, chatID, "❌ Invalid number of minutes.")
+		sendWithButtons(bot, chatID, "❌ *Invalid number of minutes*\n\nUse the extend button from *My Sites* instead\\.", sitesKeyboard(cfg, store.ByUser(userID)))
 		return
 	}
 
@@ -665,12 +959,12 @@ func handleExtendSiteCommand(bot *tgbotapi.BotAPI, cfg Config, chatID, userID in
 	if capped {
 		capNote = "\n⚠️ Capped at maximum allowed TTL."
 	}
-	sendMD(bot, chatID, fmt.Sprintf(
+	sendWithButtons(bot, chatID, fmt.Sprintf(
 		"✅ *Site extended*\n\nToken: `%s`\nExpires in: *%s*%s",
 		escapeMarkdownV2(token),
 		escapeMarkdownV2(humanDuration(time.Until(site.ExpiresAt))),
 		escapeMarkdownV2(capNote),
-	))
+	), sitesKeyboard(cfg, store.ByUser(userID)))
 }
 
 // ─────────────────────────────────────────────
@@ -681,7 +975,7 @@ func mySitesText(cfg Config, userID int64) string {
 	sites := store.ByUser(userID)
 
 	if len(sites) == 0 {
-		return "📭 *No active sites*\n\nYou don't have any hosted websites yet\\.\n\nSend me a `.zip` file to get started\\!"
+		return "📭 *No active sites*\n\nYou don't have any hosted websites yet\\.\n\nTap *Upload Guide*, then send a `.zip` or `.html` file\\."
 	}
 
 	sort.Slice(sites, func(i, j int) bool {
@@ -697,7 +991,6 @@ func mySitesText(cfg Config, userID int64) string {
 			break
 		}
 
-		url := cfg.PublicBaseURL + "/s/" + s.Token + "/"
 		pwd := "🔓 No password"
 		if s.PasswordHash != "" {
 			pwd = "🔒 Password protected"
@@ -709,9 +1002,7 @@ func mySitesText(cfg Config, userID int64) string {
 				"   📄 %d files  •  %.2f MB\n"+
 				"   👁 %d views  •  %s\n"+
 				"   ⏱ Expires in *%s*\n"+
-				"   🌐 [Open](%s)\n"+
-				"   🗑 /delete\\_site `%s`\n"+
-				"   ⏰ /extend\\_site `%s` 60\n\n",
+				"   📋 Token: `%s`\n\n",
 			i+1,
 			escapeMarkdownV2(truncate(s.OriginalName, 60)),
 			escapeMarkdownV2(s.ProjectType),
@@ -720,8 +1011,6 @@ func mySitesText(cfg Config, userID int64) string {
 			s.ViewCount,
 			escapeMarkdownV2(pwd),
 			escapeMarkdownV2(humanDuration(time.Until(s.ExpiresAt))),
-			url,
-			escapeMarkdownV2(s.Token),
 			escapeMarkdownV2(s.Token),
 		))
 	}
@@ -731,26 +1020,20 @@ func mySitesText(cfg Config, userID int64) string {
 
 func helpText(cfg Config) string {
 	admin := "disabled"
-	if cfg.AdminPassword != "" {
+	if cfg.AdminPassword != "" && cfg.PublicBaseURL != "" {
 		admin = cfg.PublicBaseURL + cfg.AdminPath
 	}
 
 	return fmt.Sprintf(
-		"🌐 *Telegram Static Site Host Bot V2*\n\n"+
+		"🌐 *Telegram Static Site Host Bot V4*\n\n"+
+			"*Button\\-first interface*\n"+
+			"Use the menu buttons for Upload Guide, My Sites, Password, Status, Extend, and Delete\\.\n\n"+
 			"*How it works:*\n"+
-			"1\\. Compress your project to `.zip`\n"+
-			"2\\. Make sure it contains `index\\.html`\n"+
-			"3\\. Upload the `.zip` to this bot\n"+
-			"4\\. Get a public URL \\+ QR code\n"+
-			"5\\. Link expires after *%s* and files are auto\\-deleted\n\n"+
-			"*Commands:*\n"+
-			"/help — show this help\n"+
-			"/status — bot status\n"+
-			"/my\\_sites — list your active websites\n"+
-			"/delete\\_site `TOKEN` — delete a website\n"+
-			"/extend\\_site `TOKEN 60` — extend by 60 minutes\n"+
-			"/password `1234` — set password for next upload\n"+
-			"/password off — disable password protection\n\n"+
+			"1\\. Prepare a `.zip` project or a single `.html` file\\.\n"+
+			"2\\. Make sure the project contains `index.html`\\.\n"+
+			"3\\. Send the file directly to this chat\\.\n"+
+			"4\\. Get a public URL, QR code, and action buttons\\.\n"+
+			"5\\. Link expires after *%s* and files are auto\\-deleted\\.\n\n"+
 			"*Supported:*\n"+
 			"HTML, CSS, JS, images, fonts, JSON, static assets\\.\n"+
 			"React/Vite/Vue/Angular/Next static exports\\.\n\n"+
@@ -1926,6 +2209,15 @@ func (u *UserStore) SetPassword(userID int64, password string) {
 	defer u.mu.Unlock()
 	s := u.settings[userID]
 	s.NextPassword = password
+	s.AwaitingPassword = false
+	u.settings[userID] = s
+}
+
+func (u *UserStore) SetAwaitingPassword(userID int64, awaiting bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	s := u.settings[userID]
+	s.AwaitingPassword = awaiting
 	u.settings[userID] = s
 }
 
