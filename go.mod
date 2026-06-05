@@ -1,4 +1,4 @@
-module telegram-video-downloader-bot
+module telegram-static-site-host-bot
 
 go 1.22
 

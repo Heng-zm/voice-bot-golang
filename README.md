@@ -1,104 +1,115 @@
-# Telegram Video Downloader Bot - Go
+# Telegram Static Site Host Bot - Go
 
-Telegram bot written in Go. Send a public video link to the bot, it downloads the video using `yt-dlp`, then sends the file back to Telegram.
+This version removes video downloading completely.
 
-## Important safety note
+The bot accepts a user-uploaded `.zip` HTML project or a single `.html` file, hosts it as a temporary public website, and returns a public URL.
 
-Use this only for videos you own or have permission to download. This bot does not bypass DRM, paid videos, private videos, or access controls.
+## Flow
 
-## Requirements
+1. User uploads `project.zip` to Telegram bot.
+2. ZIP must contain `index.html`.
+3. Bot downloads the ZIP from Telegram.
+4. Bot safely extracts static files.
+5. Bot hosts the project at:
 
-- Telegram bot token from `@BotFather`
-- Docker recommended for Render deploy
-- `yt-dlp` and `ffmpeg` are installed inside Docker image
+```text
+https://your-service-name.onrender.com/s/<secure-token>/
+```
+
+6. Link expires after 1 hour by default.
+7. Files are auto-deleted after expiration.
+
+## Supported
+
+- HTML
+- CSS
+- JavaScript
+- Images
+- Fonts
+- JSON
+- Static assets
+- Single `.html` file
+
+## Not supported
+
+- PHP
+- Python backend
+- Node backend
+- Database server
+- Server-side code execution
+
+This is a static-site host only.
 
 ## Render deploy
 
-Recommended Render service:
+Use **Web Service + Docker**.
 
 ```text
-Service Type: Background Worker
+Service Type: Web Service
 Runtime: Docker
 Dockerfile Path: ./Dockerfile
 Build Command: empty
 Start Command: empty
 ```
 
-Required environment variable:
+Required environment variables:
 
 ```env
 TELEGRAM_BOT_TOKEN=your_botfather_token
+PUBLIC_BASE_URL=https://your-service-name.onrender.com
 ```
 
-Optional:
+Recommended environment variables:
 
 ```env
-MAX_FILE_MB=48
-MAX_CONCURRENT_DOWNLOADS=2
-DOWNLOAD_TIMEOUT_MINUTES=10
+LINK_TTL_MINUTES=60
+MAX_PROJECT_MB=50
+MAX_ZIP_ENTRIES=1000
+MAX_CONCURRENT_UPLOADS=2
+SPA_FALLBACK=true
+KEEP_FILES_ON_STARTUP=false
+```
+
+Optional private bot:
+
+```env
 ALLOWED_USER_IDS=1272791365
 ```
-
-## YouTube "Sign in to confirm you're not a bot" fix
-
-Export cookies from your local PC where YouTube is logged in:
-
-```bash
-yt-dlp --cookies-from-browser chrome --cookies cookies.txt "https://www.youtube.com/"
-```
-
-For Edge:
-
-```bash
-yt-dlp --cookies-from-browser edge --cookies cookies.txt "https://www.youtube.com/"
-```
-
-Do not commit cookies to GitHub.
-
-On Render:
-
-1. Go to service -> Environment -> Secret Files
-2. Add Secret File:
-   - Filename: `youtube_cookies.txt`
-   - Contents: paste your `cookies.txt`
-3. Add Environment Variable:
-
-```env
-YTDLP_COOKIES_FILE=/etc/secrets/youtube_cookies.txt
-```
-
-Redeploy.
-
-Cookies can expire. If YouTube blocks again, export fresh cookies and update the Render Secret File.
 
 ## Local run
 
 ```bash
 go mod tidy
 export TELEGRAM_BOT_TOKEN="YOUR_BOT_TOKEN"
+export PUBLIC_BASE_URL="http://localhost:8080"
 go run .
 ```
 
-For local machine you also need:
+Open:
 
-```bash
-python3 -m pip install -U "yt-dlp[default]"
+```text
+http://localhost:8080
+http://localhost:8080/healthz
 ```
 
-and `ffmpeg`.
-
-## Commands
+## Bot commands
 
 - `/start`
 - `/help`
 - `/status`
 
-## Files
+## Security features
 
-```text
-main.go
-go.mod
-Dockerfile
-.env.example
-README.md
-```
+- Random token URL per hosted site
+- Auto-expire links
+- Auto-delete expired files
+- Blocks unsafe ZIP paths like `../`
+- Blocks symlinks in ZIP
+- Limits project size
+- Limits number of ZIP entries
+- Serves static files only
+- No server-side code execution
+
+## Important limitation
+
+Sites are stored on local service disk and registered in memory. If Render restarts, old links can stop working. For permanent hosting, upgrade to Cloudflare R2, S3, or Supabase Storage.

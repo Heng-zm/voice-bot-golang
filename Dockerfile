@@ -9,25 +9,24 @@ COPY . .
 RUN go mod tidy
 RUN CGO_ENABLED=0 GOOS=linux go build -tags netgo -trimpath -ldflags="-s -w" -o /out/app .
 
-FROM python:3.12-slim
+FROM debian:bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && python -m pip install --no-cache-dir -U "yt-dlp[default]"
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY --from=build /out/app /app/app
 
-RUN mkdir -p /app/downloads
+RUN mkdir -p /app/uploads
 
-ENV DOWNLOAD_DIR=/app/downloads
-ENV YTDLP_BIN=yt-dlp
-ENV MAX_FILE_MB=48
-ENV DOWNLOAD_TIMEOUT_MINUTES=10
-ENV MAX_CONCURRENT_DOWNLOADS=2
-ENV ALLOW_PRIVATE_URLS=false
-ENV YTDLP_FORCE_IPV4=true
+ENV UPLOAD_DIR=/app/uploads
+ENV LINK_TTL_MINUTES=60
+ENV MAX_PROJECT_MB=50
+ENV MAX_ZIP_ENTRIES=1000
+ENV MAX_CONCURRENT_UPLOADS=2
+ENV SPA_FALLBACK=true
+ENV KEEP_FILES_ON_STARTUP=false
 
 CMD ["/app/app"]
