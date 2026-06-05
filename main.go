@@ -29,6 +29,10 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
+// ─────────────────────────────────────────────
+// Types
+// ─────────────────────────────────────────────
+
 type Config struct {
 	Token                string
 	PublicBaseURL        string
@@ -42,9 +46,11 @@ type Config struct {
 	MaxTTL               time.Duration
 	MaxConcurrentUploads int
 	AllowedUsers         map[int64]bool
+	AdminUserIDs         map[int64]bool
 	SPAFallback          bool
 	KeepFilesOnStartup   bool
 	AdminPassword        string
+	AdminUsername        string
 	AdminPath            string
 }
 
@@ -86,6 +92,10 @@ type ScanResult struct {
 	TotalBytes   int64
 }
 
+// ─────────────────────────────────────────────
+// Globals
+// ─────────────────────────────────────────────
+
 var (
 	startedAt     = time.Now()
 	activeUploads int64
@@ -94,6 +104,10 @@ var (
 	store         = &SiteStore{sites: make(map[string]HostedSite)}
 	users         = &UserStore{settings: make(map[int64]UserSettings)}
 )
+
+// ─────────────────────────────────────────────
+// main
+// ─────────────────────────────────────────────
 
 func main() {
 	cfg := loadConfig()
@@ -134,6 +148,19 @@ func main() {
 	sem := make(chan struct{}, cfg.MaxConcurrentUploads)
 
 	for update := range updates {
+		if update.CallbackQuery != nil {
+			cq := update.CallbackQuery
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("panic recovered (callback): %v", r)
+					}
+				}()
+				handleCallbackQuery(bot, cfg, cq)
+			}()
+			continue
+		}
+
 		if update.Message == nil {
 			continue
 		}
@@ -146,11 +173,14 @@ func main() {
 					log.Printf("panic recovered: %v", r)
 				}
 			}()
-
 			handleMessage(bot, cfg, sem, msg)
 		}()
 	}
 }
+
+// ─────────────────────────────────────────────
+// Config
+// ─────────────────────────────────────────────
 
 func loadConfig() Config {
 	maxProjectMB := envInt64("MAX_PROJECT_MB", 80)
@@ -194,6 +224,8 @@ func loadConfig() Config {
 		adminPath = "/" + adminPath
 	}
 
+	adminUsername := envString("ADMIN_USERNAME", "admin")
+
 	return Config{
 		Token:                strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN")),
 		PublicBaseURL:        trimRightSlash(envString("PUBLIC_BASE_URL", "")),
@@ -206,13 +238,19 @@ func loadConfig() Config {
 		LinkTTL:              time.Duration(ttlMinutes) * time.Minute,
 		MaxTTL:               time.Duration(maxTTLMinutes) * time.Minute,
 		MaxConcurrentUploads: maxConcurrent,
-		AllowedUsers:         parseAllowedUsers(os.Getenv("ALLOWED_USER_IDS")),
+		AllowedUsers:         parseUserIDs(os.Getenv("ALLOWED_USER_IDS")),
+		AdminUserIDs:         parseUserIDs(os.Getenv("ADMIN_USER_IDS")),
 		SPAFallback:          envBool("SPA_FALLBACK", true),
 		KeepFilesOnStartup:   envBool("KEEP_FILES_ON_STARTUP", false),
 		AdminPassword:        strings.TrimSpace(os.Getenv("ADMIN_PASSWORD")),
+		AdminUsername:        adminUsername,
 		AdminPath:            adminPath,
 	}
 }
+
+// ─────────────────────────────────────────────
+// Message routing
+// ─────────────────────────────────────────────
 
 func handleMessage(bot *tgbotapi.BotAPI, cfg Config, sem chan struct{}, msg *tgbotapi.Message) {
 	chatID := msg.Chat.ID
@@ -220,50 +258,54 @@ func handleMessage(bot *tgbotapi.BotAPI, cfg Config, sem chan struct{}, msg *tgb
 
 	if cfg.AllowedUsers != nil {
 		if msg.From == nil || !cfg.AllowedUsers[msg.From.ID] {
-			sendText(bot, chatID, "⛔ You are not allowed to use this bot.")
+			sendMD(bot, chatID, "⛔ You are not allowed to use this bot.")
 			return
 		}
 	}
 
 	text := strings.TrimSpace(msg.Text)
 
-	if strings.HasPrefix(text, "/start") || strings.HasPrefix(text, "/help") {
-		sendText(bot, chatID, helpText(cfg))
+	switch {
+	case strings.HasPrefix(text, "/start"), strings.HasPrefix(text, "/help"):
+		sendMD(bot, chatID, helpText(cfg))
 		return
-	}
-
-	if strings.HasPrefix(text, "/status") {
-		sendText(bot, chatID, statusText(cfg))
+	case strings.HasPrefix(text, "/status"):
+		sendMD(bot, chatID, statusText(cfg))
 		return
-	}
-
-	if strings.HasPrefix(text, "/my_sites") {
-		sendText(bot, chatID, mySitesText(cfg, userID))
+	case strings.HasPrefix(text, "/my_sites"):
+		sendMD(bot, chatID, mySitesText(cfg, userID))
 		return
-	}
-
-	if strings.HasPrefix(text, "/delete_site") {
+	case strings.HasPrefix(text, "/delete_site"):
 		handleDeleteSiteCommand(bot, cfg, chatID, userID, text)
 		return
-	}
-
-	if strings.HasPrefix(text, "/extend_site") {
+	case strings.HasPrefix(text, "/extend_site"):
 		handleExtendSiteCommand(bot, cfg, chatID, userID, text)
 		return
-	}
-
-	if strings.HasPrefix(text, "/password") {
+	case strings.HasPrefix(text, "/password"):
 		handlePasswordCommand(bot, chatID, userID, text)
 		return
 	}
 
+	// No document and no recognized command
 	if msg.Document == nil {
-		sendText(bot, chatID, "📦 Please upload a static website project as .zip.\n\nZIP must contain index.html.\nCommands: /help, /password, /my_sites")
+		sendWithButtons(bot, chatID,
+			"📦 *Send me your static website project*\n\nUpload a `.zip` file that contains `index.html`, or a single `.html` file.",
+			[][]tgbotapi.InlineKeyboardButton{
+				tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonData("📖 Help", "/help"),
+					tgbotapi.NewInlineKeyboardButtonData("📊 Status", "/status"),
+				),
+				tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonData("🌐 My Sites", "/my_sites"),
+					tgbotapi.NewInlineKeyboardButtonData("🔐 Password", "/password"),
+				),
+			},
+		)
 		return
 	}
 
 	if cfg.PublicBaseURL == "" {
-		sendText(bot, chatID, "❌ PUBLIC_BASE_URL is not set.\n\nOn Render set:\nPUBLIC_BASE_URL=https://your-service-name.onrender.com")
+		sendMD(bot, chatID, "❌ *Server not configured*\n\nAsk the admin to set `PUBLIC_BASE_URL`.")
 		return
 	}
 
@@ -275,20 +317,21 @@ func handleMessage(bot *tgbotapi.BotAPI, cfg Config, sem chan struct{}, msg *tgb
 
 	ext := strings.ToLower(filepath.Ext(fileName))
 	if ext != ".zip" && ext != ".html" && ext != ".htm" {
-		sendText(bot, chatID, "❌ Unsupported file.\n\nPlease upload .zip project or single .html file.")
+		sendMD(bot, chatID, "❌ *Unsupported file type*\n\nPlease upload a `.zip` project or a single `.html` file.")
 		return
 	}
 
 	if doc.FileSize > 0 && int64(doc.FileSize) > cfg.MaxProjectBytes {
-		sendText(bot, chatID, fmt.Sprintf(
-			"❌ File too large: %.2fMB\nMax allowed: %dMB",
+		sendMD(bot, chatID, fmt.Sprintf(
+			"❌ *File too large*\n\nYour file: `%.2f MB`\nMax allowed: `%d MB`",
 			float64(doc.FileSize)/(1024*1024),
 			cfg.MaxProjectMB,
 		))
 		return
 	}
 
-	status, _ := bot.Send(tgbotapi.NewMessage(chatID, "⏳ Added to queue...\nកំពុងរង់ចាំ upload slot..."))
+	// Send queue status message
+	statusMsg, _ := bot.Send(tgbotapi.NewMessage(chatID, "⏳ Added to queue, waiting for an upload slot..."))
 
 	sem <- struct{}{}
 	atomic.AddInt64(&activeUploads, 1)
@@ -297,32 +340,32 @@ func handleMessage(bot *tgbotapi.BotAPI, cfg Config, sem chan struct{}, msg *tgb
 		atomic.AddInt64(&activeUploads, -1)
 	}()
 
-	editStatus(bot, chatID, status.MessageID, "⬇️ Downloading project from Telegram...")
+	editMD(bot, chatID, statusMsg.MessageID, "⬇️ Downloading from Telegram...")
 
 	tempDir, err := os.MkdirTemp(cfg.UploadDir, "incoming_*")
 	if err != nil {
-		editStatus(bot, chatID, status.MessageID, "❌ Cannot create temp folder.")
+		editMD(bot, chatID, statusMsg.MessageID, "❌ Cannot create temp folder. Please try again.")
 		return
 	}
 	defer os.RemoveAll(tempDir)
 
 	localFile := filepath.Join(tempDir, safeLocalName(fileName))
 	if err := downloadTelegramFile(bot, doc.FileID, localFile, cfg.MaxProjectBytes); err != nil {
-		editStatus(bot, chatID, status.MessageID, "❌ Cannot download file from Telegram:\n"+truncate(err.Error(), 3000))
+		editMD(bot, chatID, statusMsg.MessageID, "❌ *Download failed*\n\n`"+truncate(err.Error(), 200)+"`")
 		return
 	}
 
-	editStatus(bot, chatID, status.MessageID, "🛡️ Scanning project security...")
+	editMD(bot, chatID, statusMsg.MessageID, "🛡️ Scanning for security issues...")
 
 	token, err := newToken()
 	if err != nil {
-		editStatus(bot, chatID, status.MessageID, "❌ Cannot create secure site token.")
+		editMD(bot, chatID, statusMsg.MessageID, "❌ Cannot generate secure token. Please try again.")
 		return
 	}
 
 	siteBaseDir := filepath.Join(cfg.UploadDir, token)
 	if err := os.MkdirAll(siteBaseDir, 0o755); err != nil {
-		editStatus(bot, chatID, status.MessageID, "❌ Cannot create site folder.")
+		editMD(bot, chatID, statusMsg.MessageID, "❌ Cannot create site folder. Please try again.")
 		return
 	}
 
@@ -332,6 +375,8 @@ func handleMessage(bot *tgbotapi.BotAPI, cfg Config, sem chan struct{}, msg *tgb
 	var projectType string
 	var scan ScanResult
 
+	editMD(bot, chatID, statusMsg.MessageID, "📦 Extracting and processing project...")
+
 	if ext == ".zip" {
 		rootDir, sizeBytes, fileCount, projectType, scan, err = extractZipProject(localFile, siteBaseDir, cfg)
 	} else {
@@ -340,7 +385,7 @@ func handleMessage(bot *tgbotapi.BotAPI, cfg Config, sem chan struct{}, msg *tgb
 
 	if err != nil {
 		_ = os.RemoveAll(siteBaseDir)
-		editStatus(bot, chatID, status.MessageID, "❌ Project rejected:\n"+truncate(err.Error(), 3000))
+		editMD(bot, chatID, statusMsg.MessageID, "❌ *Project rejected*\n\n`"+truncate(err.Error(), 400)+"`")
 		return
 	}
 
@@ -351,7 +396,7 @@ func handleMessage(bot *tgbotapi.BotAPI, cfg Config, sem chan struct{}, msg *tgb
 		salt, hashValue, err = hashPassword(userSettings.NextPassword)
 		if err != nil {
 			_ = os.RemoveAll(siteBaseDir)
-			editStatus(bot, chatID, status.MessageID, "❌ Cannot create password protection.")
+			editMD(bot, chatID, statusMsg.MessageID, "❌ Cannot set password protection. Please try again.")
 			return
 		}
 	}
@@ -378,40 +423,103 @@ func handleMessage(bot *tgbotapi.BotAPI, cfg Config, sem chan struct{}, msg *tgb
 
 	publicURL := cfg.PublicBaseURL + "/s/" + token + "/"
 
+	// Generate QR code
 	qrPath := filepath.Join(tempDir, "site_qr.png")
 	qrOK := qrcode.WriteFile(publicURL, qrcode.Medium, 512, qrPath) == nil
 
-	warnings := ""
-	if len(scan.Warnings) > 0 {
-		warnings = "\n\n⚠️ Warnings:\n- " + strings.Join(scan.Warnings, "\n- ")
+	// Build success reply
+	passwordLine := "🔓 No password"
+	if site.PasswordHash != "" {
+		passwordLine = "🔒 Password protected"
 	}
 
-	passwordNote := "No"
-	if site.PasswordHash != "" {
-		passwordNote = "Yes"
+	warningsBlock := ""
+	if len(scan.Warnings) > 0 {
+		warningsBlock = "\n\n⚠️ *Warnings*\n" + "• " + strings.Join(scan.Warnings, "\n• ")
 	}
 
 	reply := fmt.Sprintf(
-		"✅ Website hosted successfully\n\nProject: %s\nType: %s\nFiles: %d\nSize: %.2fMB\nPassword: %s\nExpires in: %s\n\n🌐 Public URL:\n%s\n\nManage: /my_sites\nDelete: /delete_site %s%s",
-		truncate(fileName, 120),
-		projectType,
+		"✅ *Website is live\\!*\n\n"+
+			"📁 `%s`\n"+
+			"🔧 %s\n"+
+			"📄 %d files  •  %.2f MB\n"+
+			"%s\n"+
+			"⏱ Expires in *%s*\n\n"+
+			"🌐 [Open Website](%s)\n"+
+			"`%s`%s\n\n"+
+			"📋 Token: `%s`",
+		escapeMarkdownV2(truncate(fileName, 80)),
+		escapeMarkdownV2(projectType),
 		fileCount,
 		float64(sizeBytes)/(1024*1024),
-		passwordNote,
-		humanDuration(time.Until(site.ExpiresAt)),
+		escapeMarkdownV2(passwordLine),
+		escapeMarkdownV2(humanDuration(time.Until(site.ExpiresAt))),
 		publicURL,
-		token,
-		warnings,
+		escapeMarkdownV2(publicURL),
+		escapeMarkdownV2(warningsBlock),
+		escapeMarkdownV2(token),
 	)
 
-	editStatus(bot, chatID, status.MessageID, reply)
+	// Edit status with inline action buttons
+	editMsgWithButtons(bot, chatID, statusMsg.MessageID, reply,
+		[][]tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonURL("🌐 Open Website", publicURL),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("🗑 Delete Site", "/delete_site "+token),
+				tgbotapi.NewInlineKeyboardButtonData("⏰ Extend +60m", "/extend_site "+token+" 60"),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("🌐 My Sites", "/my_sites"),
+			),
+		},
+	)
 
 	if qrOK {
 		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FilePath(qrPath))
-		photo.Caption = "📱 QR Code for your website link"
+		photo.Caption = "📱 Scan to open your website"
 		_, _ = bot.Send(photo)
 	}
 }
+
+// ─────────────────────────────────────────────
+// Callback query handler (inline buttons)
+// ─────────────────────────────────────────────
+
+func handleCallbackQuery(bot *tgbotapi.BotAPI, cfg Config, cq *tgbotapi.CallbackQuery) {
+	chatID := cq.Message.Chat.ID
+	userID := cq.From.ID
+	data := strings.TrimSpace(cq.Data)
+
+	// Acknowledge the callback to remove the loading spinner
+	callback := tgbotapi.NewCallback(cq.ID, "")
+	_, _ = bot.Request(callback)
+
+	switch {
+	case data == "/help":
+		sendMD(bot, chatID, helpText(cfg))
+	case data == "/status":
+		sendMD(bot, chatID, statusText(cfg))
+	case data == "/my_sites":
+		sendMD(bot, chatID, mySitesText(cfg, int64(userID)))
+	case data == "/password":
+		current := users.Get(int64(userID))
+		if current.NextPassword == "" {
+			sendMD(bot, chatID, "🔐 *Password protection is OFF*\n\nSend `/password 1234` to protect your next upload.\nSend `/password off` to disable.")
+		} else {
+			sendMD(bot, chatID, "🔐 *Password protection is ON*\n\nYour next upload will be password protected.\nSend `/password off` to disable.")
+		}
+	case strings.HasPrefix(data, "/delete_site "):
+		handleDeleteSiteCommand(bot, cfg, chatID, int64(userID), data)
+	case strings.HasPrefix(data, "/extend_site "):
+		handleExtendSiteCommand(bot, cfg, chatID, int64(userID), data)
+	}
+}
+
+// ─────────────────────────────────────────────
+// Command handlers
+// ─────────────────────────────────────────────
 
 func handlePasswordCommand(bot *tgbotapi.BotAPI, chatID, userID int64, text string) {
 	args := strings.TrimSpace(strings.TrimPrefix(text, "/password"))
@@ -419,103 +527,114 @@ func handlePasswordCommand(bot *tgbotapi.BotAPI, chatID, userID int64, text stri
 	if args == "" {
 		current := users.Get(userID)
 		if current.NextPassword == "" {
-			sendText(bot, chatID, "🔐 Password for next upload: OFF\n\nUse:\n/password 1234\n\nDisable:\n/password off")
+			sendMD(bot, chatID, "🔐 *Password protection*\n\nStatus: OFF\n\nCommands:\n• `/password 1234` — protect next upload\n• `/password off` — disable protection")
 		} else {
-			sendText(bot, chatID, "🔐 Password for next upload: ON\n\nDisable:\n/password off")
+			sendMD(bot, chatID, "🔐 *Password protection*\n\nStatus: ON ✅\n\nYour next upload will require a password.\n\n• `/password off` — disable protection")
 		}
 		return
 	}
 
 	if strings.EqualFold(args, "off") || strings.EqualFold(args, "none") || strings.EqualFold(args, "disable") {
 		users.SetPassword(userID, "")
-		sendText(bot, chatID, "✅ Password protection disabled for your next uploads.")
+		sendMD(bot, chatID, "✅ *Password protection disabled*\n\nYour next uploads will be public.")
 		return
 	}
 
 	if len(args) < 4 {
-		sendText(bot, chatID, "❌ Password too short. Use at least 4 characters.")
+		sendMD(bot, chatID, "❌ Password too short. Use at least 4 characters.")
 		return
 	}
 
 	if len(args) > 64 {
-		sendText(bot, chatID, "❌ Password too long. Max 64 characters.")
+		sendMD(bot, chatID, "❌ Password too long. Max 64 characters.")
 		return
 	}
 
 	users.SetPassword(userID, args)
-	sendText(bot, chatID, "✅ Password protection enabled for your next uploads.\n\nYour next hosted website will require this password.")
+	sendMD(bot, chatID, "✅ *Password protection enabled*\n\nYour next uploaded website will require a password to view.\n\nTo disable: `/password off`")
 }
 
 func handleDeleteSiteCommand(bot *tgbotapi.BotAPI, cfg Config, chatID, userID int64, text string) {
 	fields := strings.Fields(text)
 	if len(fields) < 2 {
-		sendText(bot, chatID, "Usage:\n/delete_site SITE_TOKEN\n\nUse /my_sites to see tokens.")
+		sendMD(bot, chatID, "ℹ️ *Usage:* `/delete_site TOKEN`\n\nUse /my\\_sites to see your site tokens.")
 		return
 	}
 
 	token := fields[1]
 	site, ok := store.Get(token)
 	if !ok {
-		sendText(bot, chatID, "❌ Site not found or already expired.")
+		sendMD(bot, chatID, "❌ Site not found or already expired.")
 		return
 	}
 
 	if site.UploadedBy != userID && !isAdminUser(cfg, userID) {
-		sendText(bot, chatID, "⛔ You can delete only your own sites.")
+		sendMD(bot, chatID, "⛔ You can only delete your own sites.")
 		return
 	}
 
 	store.Delete(token)
 	_ = os.RemoveAll(site.BaseDir)
-	sendText(bot, chatID, "✅ Site deleted:\n"+token)
+	sendMD(bot, chatID, fmt.Sprintf("✅ *Site deleted*\n\nToken: `%s`", escapeMarkdownV2(token)))
 }
 
 func handleExtendSiteCommand(bot *tgbotapi.BotAPI, cfg Config, chatID, userID int64, text string) {
 	fields := strings.Fields(text)
 	if len(fields) < 3 {
-		sendText(bot, chatID, "Usage:\n/extend_site SITE_TOKEN MINUTES\n\nExample:\n/extend_site abc123 60")
+		sendMD(bot, chatID, "ℹ️ *Usage:* `/extend_site TOKEN MINUTES`\n\nExample: `/extend_site abc123 60`")
 		return
 	}
 
 	token := fields[1]
 	minutes, err := strconv.Atoi(fields[2])
 	if err != nil || minutes < 1 {
-		sendText(bot, chatID, "❌ Invalid minutes.")
+		sendMD(bot, chatID, "❌ Invalid number of minutes.")
 		return
 	}
 
 	site, ok := store.Get(token)
 	if !ok {
-		sendText(bot, chatID, "❌ Site not found or expired.")
+		sendMD(bot, chatID, "❌ Site not found or expired.")
 		return
 	}
 
 	if site.UploadedBy != userID && !isAdminUser(cfg, userID) {
-		sendText(bot, chatID, "⛔ You can extend only your own sites.")
+		sendMD(bot, chatID, "⛔ You can only extend your own sites.")
 		return
 	}
 
 	newExpiry := site.ExpiresAt.Add(time.Duration(minutes) * time.Minute)
 	maxExpiry := site.CreatedAt.Add(cfg.MaxTTL)
+	capped := false
 	if newExpiry.After(maxExpiry) {
 		newExpiry = maxExpiry
+		capped = true
 	}
 
 	site.ExpiresAt = newExpiry
 	store.Update(site)
 
-	sendText(bot, chatID, fmt.Sprintf(
-		"✅ Site extended.\n\nToken: %s\nExpires in: %s",
-		token,
-		humanDuration(time.Until(site.ExpiresAt)),
+	capNote := ""
+	if capped {
+		capNote = "\n⚠️ Capped at maximum allowed TTL."
+	}
+	sendMD(bot, chatID, fmt.Sprintf(
+		"✅ *Site extended*\n\nToken: `%s`\nExpires in: *%s*%s",
+		escapeMarkdownV2(token),
+		escapeMarkdownV2(humanDuration(time.Until(site.ExpiresAt))),
+		escapeMarkdownV2(capNote),
 	))
 }
+
+// ─────────────────────────────────────────────
+// Text builders
+// ─────────────────────────────────────────────
 
 func mySitesText(cfg Config, userID int64) string {
 	sites := store.ByUser(userID)
 
 	if len(sites) == 0 {
-		return "📭 You have no active hosted sites.\n\nUpload a .zip project that contains index.html."
+		return "📭 *No active sites*\n\nYou don't have any hosted websites yet\\.\n\nSend me a `.zip` file to get started\\!"
 	}
 
 	sort.Slice(sites, func(i, j int) bool {
@@ -523,37 +642,122 @@ func mySitesText(cfg Config, userID int64) string {
 	})
 
 	var b strings.Builder
-	b.WriteString("🌐 Your active sites\n\n")
+	b.WriteString(fmt.Sprintf("🌐 *Your active sites* \\(%d\\)\n\n", min(len(sites), 10)))
 
 	for i, s := range sites {
 		if i >= 10 {
-			b.WriteString("\nOnly showing latest 10 sites.")
+			b.WriteString("_Showing 10 most recent sites\\._")
 			break
 		}
 
 		url := cfg.PublicBaseURL + "/s/" + s.Token + "/"
-		pwd := "No"
+		pwd := "🔓 No password"
 		if s.PasswordHash != "" {
-			pwd = "Yes"
+			pwd = "🔒 Password protected"
 		}
 
 		b.WriteString(fmt.Sprintf(
-			"%d. %s\nType: %s\nURL: %s\nToken: %s\nViews: %d\nPassword: %s\nExpires in: %s\nDelete: /delete_site %s\nExtend: /extend_site %s 60\n\n",
+			"*%d\\.* `%s`\n"+
+				"   🔧 %s\n"+
+				"   📄 %d files  •  %.2f MB\n"+
+				"   👁 %d views  •  %s\n"+
+				"   ⏱ Expires in *%s*\n"+
+				"   🌐 [Open](%s)\n"+
+				"   🗑 /delete\\_site `%s`\n"+
+				"   ⏰ /extend\\_site `%s` 60\n\n",
 			i+1,
-			truncate(s.OriginalName, 80),
-			s.ProjectType,
-			url,
-			s.Token,
+			escapeMarkdownV2(truncate(s.OriginalName, 60)),
+			escapeMarkdownV2(s.ProjectType),
+			s.FileCount,
+			float64(s.SizeBytes)/(1024*1024),
 			s.ViewCount,
-			pwd,
-			humanDuration(time.Until(s.ExpiresAt)),
-			s.Token,
-			s.Token,
+			escapeMarkdownV2(pwd),
+			escapeMarkdownV2(humanDuration(time.Until(s.ExpiresAt))),
+			url,
+			escapeMarkdownV2(s.Token),
+			escapeMarkdownV2(s.Token),
 		))
 	}
 
 	return b.String()
 }
+
+func helpText(cfg Config) string {
+	admin := "disabled"
+	if cfg.AdminPassword != "" {
+		admin = cfg.PublicBaseURL + cfg.AdminPath
+	}
+
+	return fmt.Sprintf(
+		"🌐 *Telegram Static Site Host Bot V2*\n\n"+
+			"*How it works:*\n"+
+			"1\\. Compress your project to `.zip`\n"+
+			"2\\. Make sure it contains `index\\.html`\n"+
+			"3\\. Upload the `.zip` to this bot\n"+
+			"4\\. Get a public URL \\+ QR code\n"+
+			"5\\. Link expires after *%s* and files are auto\\-deleted\n\n"+
+			"*Commands:*\n"+
+			"/help — show this help\n"+
+			"/status — bot status\n"+
+			"/my\\_sites — list your active websites\n"+
+			"/delete\\_site `TOKEN` — delete a website\n"+
+			"/extend\\_site `TOKEN 60` — extend by 60 minutes\n"+
+			"/password `1234` — set password for next upload\n"+
+			"/password off — disable password protection\n\n"+
+			"*Supported:*\n"+
+			"HTML, CSS, JS, images, fonts, JSON, static assets\\.\n"+
+			"React/Vite/Vue/Angular/Next static exports\\.\n\n"+
+			"*Not supported:*\n"+
+			"PHP, Python, Node backend, database, server\\-side code\\.\n\n"+
+			"*Limits:*\n"+
+			"• Max project: `%d MB`\n"+
+			"• Max single file: `%d MB`\n"+
+			"• Max zip entries: `%d`\n"+
+			"• Default TTL: `%s`\n"+
+			"• Max TTL: `%s`\n"+
+			"• SPA fallback: `%s`\n\n"+
+			"*Admin:* %s",
+		escapeMarkdownV2(humanDuration(cfg.LinkTTL)),
+		cfg.MaxProjectMB,
+		cfg.MaxSingleFileMB,
+		cfg.MaxZipEntries,
+		escapeMarkdownV2(humanDuration(cfg.LinkTTL)),
+		escapeMarkdownV2(humanDuration(cfg.MaxTTL)),
+		escapeMarkdownV2(yesNo(cfg.SPAFallback)),
+		escapeMarkdownV2(admin),
+	)
+}
+
+func statusText(cfg Config) string {
+	return fmt.Sprintf(
+		"📊 *Bot Status*\n\n"+
+			"⏰ Uptime: `%s`\n"+
+			"🔄 Active uploads: `%d`\n"+
+			"🌐 Hosted sites now: `%d`\n"+
+			"📈 Total sites ever: `%d`\n"+
+			"👁 Total views: `%d`\n\n"+
+			"*Limits:*\n"+
+			"• Max project: `%d MB`\n"+
+			"• Max single file: `%d MB`\n"+
+			"• Max zip entries: `%d`\n"+
+			"• Link TTL: `%s`\n\n"+
+			"*Server:* `%s`",
+		escapeMarkdownV2(time.Since(startedAt).Round(time.Second).String()),
+		atomic.LoadInt64(&activeUploads),
+		store.Count(),
+		atomic.LoadInt64(&totalSites),
+		atomic.LoadInt64(&totalViews),
+		cfg.MaxProjectMB,
+		cfg.MaxSingleFileMB,
+		cfg.MaxZipEntries,
+		escapeMarkdownV2(humanDuration(cfg.LinkTTL)),
+		escapeMarkdownV2(cfg.PublicBaseURL),
+	)
+}
+
+// ─────────────────────────────────────────────
+// File download
+// ─────────────────────────────────────────────
 
 func downloadTelegramFile(bot *tgbotapi.BotAPI, fileID string, dest string, maxBytes int64) error {
 	file, err := bot.GetFile(tgbotapi.FileConfig{FileID: fileID})
@@ -563,7 +767,7 @@ func downloadTelegramFile(bot *tgbotapi.BotAPI, fileID string, dest string, maxB
 
 	downloadURL := file.Link(bot.Token)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
@@ -578,7 +782,7 @@ func downloadTelegramFile(bot *tgbotapi.BotAPI, fileID string, dest string, maxB
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("Telegram file HTTP status: %s", resp.Status)
+		return fmt.Errorf("telegram file server returned HTTP %s", resp.Status)
 	}
 
 	out, err := os.Create(dest)
@@ -598,11 +802,15 @@ func downloadTelegramFile(bot *tgbotapi.BotAPI, fileID string, dest string, maxB
 	}
 
 	if written > maxBytes {
-		return fmt.Errorf("file exceeds max size %dMB", maxBytes/(1024*1024))
+		return fmt.Errorf("file exceeds max size %d MB", maxBytes/(1024*1024))
 	}
 
 	return nil
 }
+
+// ─────────────────────────────────────────────
+// ZIP extraction
+// ─────────────────────────────────────────────
 
 func extractZipProject(zipPath string, destDir string, cfg Config) (string, int64, int, string, ScanResult, error) {
 	reader, err := zip.OpenReader(zipPath)
@@ -677,7 +885,7 @@ func extractZipProject(zipPath string, destDir string, cfg Config) (string, int6
 		count++
 
 		if total > cfg.MaxProjectBytes {
-			return "", 0, 0, "", scan, fmt.Errorf("extracted project exceeds max size %dMB", cfg.MaxProjectMB)
+			return "", 0, 0, "", scan, fmt.Errorf("extracted project exceeds max size %d MB", cfg.MaxProjectMB)
 		}
 	}
 
@@ -689,6 +897,10 @@ func extractZipProject(zipPath string, destDir string, cfg Config) (string, int6
 	return root, total, count, projectType, scan, nil
 }
 
+// ─────────────────────────────────────────────
+// ZIP security scanner
+// ─────────────────────────────────────────────
+
 func scanZip(files []*zip.File, cfg Config) (ScanResult, error) {
 	result := ScanResult{}
 
@@ -697,7 +909,7 @@ func scanZip(files []*zip.File, cfg Config) (ScanResult, error) {
 	}
 
 	if len(files) > cfg.MaxZipEntries {
-		return result, fmt.Errorf("too many files in zip: %d. Max: %d", len(files), cfg.MaxZipEntries)
+		return result, fmt.Errorf("too many files in zip: %d (max %d)", len(files), cfg.MaxZipEntries)
 	}
 
 	indexFound := false
@@ -715,7 +927,7 @@ func scanZip(files []*zip.File, cfg Config) (ScanResult, error) {
 		}
 
 		if f.FileInfo().Mode()&os.ModeSymlink != 0 {
-			return result, fmt.Errorf("symlink not allowed in zip: %s", f.Name)
+			return result, fmt.Errorf("symlinks not allowed in zip: %s", f.Name)
 		}
 
 		ext := strings.ToLower(filepath.Ext(cleanName))
@@ -730,7 +942,7 @@ func scanZip(files []*zip.File, cfg Config) (ScanResult, error) {
 		result.TotalBytes += size
 
 		if size > cfg.MaxSingleFileBytes {
-			return result, fmt.Errorf("single file too large: %s is %.2fMB. Max single file: %dMB",
+			return result, fmt.Errorf("file too large: %s (%.2f MB, max %d MB)",
 				cleanName,
 				float64(size)/(1024*1024),
 				cfg.MaxSingleFileMB,
@@ -738,7 +950,7 @@ func scanZip(files []*zip.File, cfg Config) (ScanResult, error) {
 		}
 
 		if result.TotalBytes > cfg.MaxProjectBytes {
-			return result, fmt.Errorf("project too large after unzip: %.2fMB. Max: %dMB",
+			return result, fmt.Errorf("project too large when unzipped: %.2f MB (max %d MB)",
 				float64(result.TotalBytes)/(1024*1024),
 				cfg.MaxProjectMB,
 			)
@@ -754,11 +966,11 @@ func scanZip(files []*zip.File, cfg Config) (ScanResult, error) {
 	}
 
 	if len(result.BlockedFiles) > 0 {
-		maxShow := result.BlockedFiles
-		if len(maxShow) > 10 {
-			maxShow = maxShow[:10]
+		show := result.BlockedFiles
+		if len(show) > 10 {
+			show = show[:10]
 		}
-		return result, fmt.Errorf("blocked unsafe files found:\n- %s", strings.Join(maxShow, "\n- "))
+		return result, fmt.Errorf("blocked unsafe files found:\n• %s", strings.Join(show, "\n• "))
 	}
 
 	if !indexFound {
@@ -813,13 +1025,17 @@ func isBlockedPath(lowerPath, base, ext string) bool {
 	return false
 }
 
+// ─────────────────────────────────────────────
+// Single HTML install
+// ─────────────────────────────────────────────
+
 func installSingleHTML(htmlPath string, destDir string, cfg Config) (string, int64, int, string, ScanResult, error) {
 	info, err := os.Stat(htmlPath)
 	if err != nil {
 		return "", 0, 0, "", ScanResult{}, err
 	}
 	if info.Size() > cfg.MaxProjectBytes {
-		return "", 0, 0, "", ScanResult{}, fmt.Errorf("html file exceeds max size %dMB", cfg.MaxProjectMB)
+		return "", 0, 0, "", ScanResult{}, fmt.Errorf("html file exceeds max size %d MB", cfg.MaxProjectMB)
 	}
 
 	target := filepath.Join(destDir, "index.html")
@@ -840,13 +1056,13 @@ func installSingleHTML(htmlPath string, destDir string, cfg Config) (string, int
 		return "", 0, 0, "", ScanResult{}, err
 	}
 
-	scan := ScanResult{
-		FileCount:  1,
-		TotalBytes: n,
-	}
-
+	scan := ScanResult{FileCount: 1, TotalBytes: n}
 	return destDir, n, 1, "Single HTML", scan, nil
 }
+
+// ─────────────────────────────────────────────
+// Project type detection
+// ─────────────────────────────────────────────
 
 func detectProjectRootAndType(destDir string) (string, string, error) {
 	candidates := []string{
@@ -861,11 +1077,13 @@ func detectProjectRootAndType(destDir string) (string, string, error) {
 	entries, _ := os.ReadDir(destDir)
 	for _, e := range entries {
 		if e.IsDir() {
-			candidates = append(candidates, filepath.Join(destDir, e.Name()))
-			candidates = append(candidates, filepath.Join(destDir, e.Name(), "dist"))
-			candidates = append(candidates, filepath.Join(destDir, e.Name(), "build"))
-			candidates = append(candidates, filepath.Join(destDir, e.Name(), "public"))
-			candidates = append(candidates, filepath.Join(destDir, e.Name(), "out"))
+			candidates = append(candidates,
+				filepath.Join(destDir, e.Name()),
+				filepath.Join(destDir, e.Name(), "dist"),
+				filepath.Join(destDir, e.Name(), "build"),
+				filepath.Join(destDir, e.Name(), "public"),
+				filepath.Join(destDir, e.Name(), "out"),
+			)
 		}
 	}
 
@@ -875,15 +1093,13 @@ func detectProjectRootAndType(destDir string) (string, string, error) {
 		}
 	}
 
+	// Deep search fallback
 	var indexes []string
 	err := filepath.WalkDir(destDir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		if d.IsDir() {
-			return nil
-		}
-		if strings.EqualFold(d.Name(), "index.html") {
+		if !d.IsDir() && strings.EqualFold(d.Name(), "index.html") {
 			indexes = append(indexes, path)
 		}
 		return nil
@@ -927,18 +1143,21 @@ func detectProjectType(rootDir, allDir string) string {
 		}
 	}
 
-	if filepath.Base(rootDir) == "dist" {
+	switch filepath.Base(rootDir) {
+	case "dist":
 		return "dist static build"
-	}
-	if filepath.Base(rootDir) == "build" {
+	case "build":
 		return "build static site"
-	}
-	if filepath.Base(rootDir) == "public" {
+	case "public":
 		return "public static site"
 	}
 
 	return "HTML static site"
 }
+
+// ─────────────────────────────────────────────
+// HTTP server
+// ─────────────────────────────────────────────
 
 func startHTTPServer(cfg Config) {
 	port := strings.TrimSpace(os.Getenv("PORT"))
@@ -958,8 +1177,7 @@ func startHTTPServer(cfg Config) {
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = fmt.Fprintf(
-			w,
+		_, _ = fmt.Fprintf(w,
 			"ok\nuptime=%s\nactive_uploads=%d\ntotal_sites=%d\nhosted_sites=%d\ntotal_views=%d\n",
 			time.Since(startedAt).Round(time.Second),
 			atomic.LoadInt64(&activeUploads),
@@ -986,15 +1204,19 @@ func startHTTPServer(cfg Config) {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	log.Printf("static site host listening on :%s", port)
+	log.Printf("HTTP server listening on :%s", port)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("http server failed: %v", err)
 	}
 }
 
+// ─────────────────────────────────────────────
+// Admin dashboard
+// ─────────────────────────────────────────────
+
 func handleAdmin(w http.ResponseWriter, r *http.Request, cfg Config) {
 	if cfg.AdminPassword == "" {
-		http.Error(w, "Admin dashboard disabled. Set ADMIN_PASSWORD.", http.StatusForbidden)
+		http.Error(w, "Admin dashboard disabled. Set ADMIN_PASSWORD env var.", http.StatusForbidden)
 		return
 	}
 
@@ -1012,10 +1234,11 @@ func handleAdmin(w http.ResponseWriter, r *http.Request, cfg Config) {
 
 	if strings.HasPrefix(path, "/delete/") {
 		token := strings.TrimPrefix(path, "/delete/")
-		site, ok := store.Get(token)
-		if ok {
-			store.Delete(token)
-			_ = os.RemoveAll(site.BaseDir)
+		if token != "" {
+			if site, ok := store.Get(token); ok {
+				store.Delete(token)
+				_ = os.RemoveAll(site.BaseDir)
+			}
 		}
 		http.Redirect(w, r, cfg.AdminPath, http.StatusSeeOther)
 		return
@@ -1023,10 +1246,17 @@ func handleAdmin(w http.ResponseWriter, r *http.Request, cfg Config) {
 
 	if strings.HasPrefix(path, "/extend/") {
 		token := strings.TrimPrefix(path, "/extend/")
-		site, ok := store.Get(token)
-		if ok {
-			site.ExpiresAt = time.Now().Add(cfg.LinkTTL)
-			store.Update(site)
+		if token != "" {
+			if site, ok := store.Get(token); ok {
+				// Add the default TTL on top of current expiry, capped at MaxTTL from creation
+				newExpiry := site.ExpiresAt.Add(cfg.LinkTTL)
+				maxExpiry := site.CreatedAt.Add(cfg.MaxTTL)
+				if newExpiry.After(maxExpiry) {
+					newExpiry = maxExpiry
+				}
+				site.ExpiresAt = newExpiry
+				store.Update(site)
+			}
 		}
 		http.Redirect(w, r, cfg.AdminPath, http.StatusSeeOther)
 		return
@@ -1040,12 +1270,8 @@ func checkAdminAuth(r *http.Request, cfg Config) bool {
 	if !ok {
 		return false
 	}
-
-	adminUser := envString("ADMIN_USERNAME", "admin")
-
-	userOK := subtle.ConstantTimeCompare([]byte(user), []byte(adminUser)) == 1
+	userOK := subtle.ConstantTimeCompare([]byte(user), []byte(cfg.AdminUsername)) == 1
 	passOK := subtle.ConstantTimeCompare([]byte(pass), []byte(cfg.AdminPassword)) == 1
-
 	return userOK && passOK
 }
 
@@ -1062,65 +1288,94 @@ func writeAdminDashboard(w http.ResponseWriter, cfg Config) {
 		publicURL := cfg.PublicBaseURL + "/s/" + s.Token + "/"
 		pwd := "No"
 		if s.PasswordHash != "" {
-			pwd = "Yes"
+			pwd = "Yes 🔒"
 		}
+		expiresIn := humanDuration(time.Until(s.ExpiresAt))
 
 		rows.WriteString(fmt.Sprintf(`<tr>
-<td><a href="%s" target="_blank">%s</a><br><small>%s</small></td>
-<td>%s</td>
+<td><a href="%s" target="_blank">%s</a><br><code class="token">%s</code></td>
+<td><span class="badge">%s</span></td>
 <td>%s</td>
 <td>%d</td>
 <td>%.2f MB</td>
-<td>%d</td>
+<td><span class="views">%d</span></td>
 <td>%s</td>
-<td>%s</td>
-<td><a class="btn" href="%s/extend/%s">Extend</a> <a class="btn danger" href="%s/delete/%s" onclick="return confirm('Delete this site?')">Delete</a></td>
+<td><span class="ttl">%s</span></td>
+<td class="actions">
+  <a class="btn" href="%s/extend/%s">⏰ Extend</a>
+  <a class="btn danger" href="%s/delete/%s" onclick="return confirm('Delete site %s?')">🗑 Delete</a>
+</td>
 </tr>`,
 			html.EscapeString(publicURL),
-			html.EscapeString(truncate(s.OriginalName, 50)),
+			html.EscapeString(truncate(s.OriginalName, 40)),
 			html.EscapeString(s.Token),
 			html.EscapeString(s.ProjectType),
 			html.EscapeString(s.Username),
 			s.FileCount,
 			float64(s.SizeBytes)/(1024*1024),
 			s.ViewCount,
-			pwd,
-			html.EscapeString(humanDuration(time.Until(s.ExpiresAt))),
+			html.EscapeString(pwd),
+			html.EscapeString(expiresIn),
 			html.EscapeString(cfg.AdminPath),
 			html.EscapeString(s.Token),
 			html.EscapeString(cfg.AdminPath),
+			html.EscapeString(s.Token),
 			html.EscapeString(s.Token),
 		))
 	}
 
+	noSitesRow := ""
+	if len(sites) == 0 {
+		noSitesRow = `<tr><td colspan="9" style="text-align:center;padding:32px;color:#aebce3">No active sites</td></tr>`
+	}
+
 	_, _ = fmt.Fprintf(w, `<!doctype html>
-<html><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Admin Dashboard</title>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin Dashboard — Static Site Host</title>
 <style>
-body{font-family:Arial,sans-serif;background:#0b1020;color:#e8eefc;margin:0;padding:24px}
-.card{background:#121a33;border:1px solid #26345e;border-radius:18px;padding:20px;box-shadow:0 20px 50px rgba(0,0,0,.35)}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:18px}
-.metric{background:#1b2547;border:1px solid #344678;border-radius:14px;padding:14px}
-.metric b{display:block;font-size:24px}
-table{width:100%%;border-collapse:collapse;margin-top:16px}
-th,td{border-bottom:1px solid #26345e;padding:10px;text-align:left;vertical-align:top}
-a{color:#8ab4ff}.btn{display:inline-block;background:#26345e;color:#fff;padding:6px 10px;border-radius:8px;text-decoration:none;margin:2px}.danger{background:#7a2630}
-small{color:#aebce3}
+*{box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;background:#0b1020;color:#e8eefc;margin:0;padding:24px;min-height:100vh}
+h1{margin:0 0 20px;font-size:22px}
+h2{margin:0 0 16px;font-size:16px;color:#aebce3;font-weight:500;text-transform:uppercase;letter-spacing:.05em}
+.topbar{display:flex;align-items:center;gap:12px;margin-bottom:24px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:24px}
+.metric{background:#121a33;border:1px solid #26345e;border-radius:14px;padding:16px}
+.metric label{display:block;font-size:12px;color:#8ab4ff;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
+.metric b{display:block;font-size:28px;font-weight:700;line-height:1}
+.card{background:#121a33;border:1px solid #26345e;border-radius:16px;padding:20px;overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{padding:10px 12px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#8ab4ff;border-bottom:1px solid #26345e;white-space:nowrap}
+td{padding:12px;border-bottom:1px solid #1a2444;vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:#16203a}
+a{color:#8ab4ff;text-decoration:none}
+a:hover{text-decoration:underline}
+.token{font-size:11px;color:#aebce3;background:#0b1020;padding:2px 5px;border-radius:5px;border:1px solid #26345e}
+.badge{display:inline-block;background:#1f2a4d;border:1px solid #344678;border-radius:20px;padding:3px 10px;font-size:12px;white-space:nowrap}
+.views{color:#7be0a0;font-weight:600}
+.ttl{color:#f0a050;font-weight:600}
+.actions{white-space:nowrap}
+.btn{display:inline-flex;align-items:center;gap:4px;background:#26345e;color:#e8eefc;padding:6px 12px;border-radius:8px;text-decoration:none;font-size:12px;margin:2px;transition:background .15s}
+.btn:hover{background:#344678;text-decoration:none}
+.btn.danger{background:#6b2230}
+.btn.danger:hover{background:#7d2838}
+code{background:#0b1020;border:1px solid #26345e;border-radius:6px;padding:2px 6px;font-size:12px}
 </style>
 </head><body>
-<h1>🛠 Admin Dashboard</h1>
+<div class="topbar"><h1>🛠 Admin Dashboard</h1></div>
 <div class="grid">
-<div class="metric">Active uploads <b>%d</b></div>
-<div class="metric">Hosted sites <b>%d</b></div>
-<div class="metric">Total sites <b>%d</b></div>
-<div class="metric">Total views <b>%d</b></div>
+  <div class="metric"><label>Active Uploads</label><b>%d</b></div>
+  <div class="metric"><label>Hosted Sites</label><b>%d</b></div>
+  <div class="metric"><label>Total Sites</label><b>%d</b></div>
+  <div class="metric"><label>Total Views</label><b>%d</b></div>
 </div>
 <div class="card">
 <h2>Active Sites</h2>
 <table>
 <thead><tr><th>Site</th><th>Type</th><th>User</th><th>Files</th><th>Size</th><th>Views</th><th>Password</th><th>Expires</th><th>Actions</th></tr></thead>
-<tbody>%s</tbody>
+<tbody>%s%s</tbody>
 </table>
 </div>
 </body></html>`,
@@ -1129,8 +1384,13 @@ small{color:#aebce3}
 		atomic.LoadInt64(&totalSites),
 		atomic.LoadInt64(&totalViews),
 		rows.String(),
+		noSitesRow,
 	)
 }
+
+// ─────────────────────────────────────────────
+// Site request handler
+// ─────────────────────────────────────────────
 
 func handleSiteRequest(w http.ResponseWriter, r *http.Request, cfg Config) {
 	rest := strings.TrimPrefix(r.URL.Path, "/s/")
@@ -1148,14 +1408,14 @@ func handleSiteRequest(w http.ResponseWriter, r *http.Request, cfg Config) {
 
 	site, ok := store.Get(token)
 	if !ok {
-		http.Error(w, "Site not found or expired.", http.StatusGone)
+		writeExpiredPage(w, "Site not found or expired.")
 		return
 	}
 
 	if time.Now().After(site.ExpiresAt) {
 		store.Delete(token)
 		_ = os.RemoveAll(site.BaseDir)
-		http.Error(w, "This site link has expired.", http.StatusGone)
+		writeExpiredPage(w, "This site link has expired.")
 		return
 	}
 
@@ -1201,13 +1461,16 @@ func handleSiteRequest(w http.ResponseWriter, r *http.Request, cfg Config) {
 		return
 	}
 
-	info, err := os.Stat(target)
-	if err != nil {
+	info, statErr := os.Stat(target)
+	if statErr != nil {
 		if cfg.SPAFallback {
-			target = filepath.Join(rootAbs, "index.html")
-			info, err = os.Stat(target)
+			fallback := filepath.Join(rootAbs, "index.html")
+			info, statErr = os.Stat(fallback)
+			if statErr == nil {
+				target = fallback
+			}
 		}
-		if err != nil {
+		if statErr != nil {
 			http.NotFound(w, r)
 			return
 		}
@@ -1220,8 +1483,7 @@ func handleSiteRequest(w http.ResponseWriter, r *http.Request, cfg Config) {
 			return
 		}
 		target = indexPath
-		info, err = os.Stat(target)
-		if err != nil {
+		if _, err := os.Stat(target); err != nil {
 			http.NotFound(w, r)
 			return
 		}
@@ -1235,22 +1497,25 @@ func handleSiteRequest(w http.ResponseWriter, r *http.Request, cfg Config) {
 	http.ServeFile(w, r, target)
 }
 
+// ─────────────────────────────────────────────
+// Password auth
+// ─────────────────────────────────────────────
+
 func handleSiteLogin(w http.ResponseWriter, r *http.Request, site HostedSite) {
 	if err := r.ParseForm(); err != nil {
-		writePasswordPageWithError(w, site, "Invalid form.")
+		writePasswordPageWithError(w, site, "Invalid form submission.")
 		return
 	}
 
 	password := r.FormValue("password")
 	if !verifyPassword(password, site.PasswordSalt, site.PasswordHash) {
-		writePasswordPageWithError(w, site, "Wrong password.")
+		writePasswordPageWithError(w, site, "Incorrect password. Please try again.")
 		return
 	}
 
-	cookieValue := authCookieValue(site)
 	cookie := &http.Cookie{
 		Name:     "site_auth_" + site.Token,
-		Value:    cookieValue,
+		Value:    authCookieValue(site),
 		Path:     "/s/" + site.Token + "/",
 		Expires:  site.ExpiresAt,
 		HttpOnly: true,
@@ -1266,7 +1531,6 @@ func isPasswordAuthed(r *http.Request, site HostedSite) bool {
 	if err != nil {
 		return false
 	}
-
 	expected := authCookieValue(site)
 	return subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(expected)) == 1
 }
@@ -1275,6 +1539,10 @@ func authCookieValue(site HostedSite) string {
 	sum := sha256.Sum256([]byte(site.Token + ":" + site.PasswordHash + ":" + site.PasswordSalt))
 	return hex.EncodeToString(sum[:])
 }
+
+// ─────────────────────────────────────────────
+// HTML pages
+// ─────────────────────────────────────────────
 
 func writePasswordPage(w http.ResponseWriter, site HostedSite) {
 	writePasswordPageWithError(w, site, "")
@@ -1285,26 +1553,34 @@ func writePasswordPageWithError(w http.ResponseWriter, site HostedSite, errMsg s
 
 	errHTML := ""
 	if errMsg != "" {
-		errHTML = `<p class="err">` + html.EscapeString(errMsg) + `</p>`
+		errHTML = `<div class="err">` + html.EscapeString(errMsg) + `</div>`
 	}
 
-	_, _ = fmt.Fprintf(w, `<!doctype html><html><head>
+	_, _ = fmt.Fprintf(w, `<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Password Required</title>
 <style>
-body{font-family:Arial,sans-serif;background:#0b1020;color:#e8eefc;margin:0;display:grid;place-items:center;min-height:100vh;padding:20px}
-.card{width:100%%;max-width:420px;background:#121a33;border:1px solid #26345e;border-radius:18px;padding:24px;box-shadow:0 20px 50px rgba(0,0,0,.35)}
-input,button{width:100%%;box-sizing:border-box;padding:12px;border-radius:10px;border:1px solid #344678;margin-top:10px}
-input{background:#0b1020;color:#fff}button{background:#4776ff;color:#fff;font-weight:bold;cursor:pointer}
-.err{color:#ff9aa8}
-.small{color:#aebce3;font-size:14px}
+*{box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;background:#0b1020;color:#e8eefc;margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.card{width:100%%;max-width:400px;background:#121a33;border:1px solid #26345e;border-radius:20px;padding:32px;box-shadow:0 24px 60px rgba(0,0,0,.45)}
+h1{margin:0 0 6px;font-size:20px}
+.sub{color:#aebce3;font-size:14px;margin:0 0 24px}
+label{display:block;font-size:13px;color:#8ab4ff;margin-bottom:6px}
+input[type=password]{width:100%%;background:#0b1020;border:1px solid #344678;border-radius:10px;color:#e8eefc;padding:12px 14px;font-size:15px;outline:none;transition:border-color .15s}
+input[type=password]:focus{border-color:#4776ff}
+button{width:100%%;background:#4776ff;color:#fff;border:none;border-radius:10px;padding:13px;font-size:15px;font-weight:600;cursor:pointer;margin-top:14px;transition:background .15s}
+button:hover{background:#3a68e8}
+.err{background:#3d1620;border:1px solid #7a2630;border-radius:10px;padding:10px 14px;font-size:14px;color:#ff9aa8;margin-bottom:16px}
+.lock{font-size:40px;text-align:center;margin-bottom:16px}
 </style></head><body>
-<form class="card" method="post">
-<h1>🔐 Password Required</h1>
-<p class="small">%s</p>
+<form class="card" method="post" autocomplete="off">
+<div class="lock">🔐</div>
+<h1>Password Required</h1>
+<p class="sub">%s</p>
 %s
-<input type="password" name="password" placeholder="Enter password" autofocus required>
-<button type="submit">Open Website</button>
+<label for="pw">Enter password to continue</label>
+<input type="password" id="pw" name="password" placeholder="Password" autofocus required>
+<button type="submit">Unlock Website</button>
 </form>
 </body></html>`,
 		html.EscapeString(site.OriginalName),
@@ -1312,52 +1588,93 @@ input{background:#0b1020;color:#fff}button{background:#4776ff;color:#fff;font-we
 	)
 }
 
+func writeExpiredPage(w http.ResponseWriter, message string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusGone)
+	_, _ = fmt.Fprintf(w, `<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Site Expired</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;background:#0b1020;color:#e8eefc;margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;text-align:center;padding:20px}
+.card{background:#121a33;border:1px solid #26345e;border-radius:20px;padding:40px 32px;max-width:380px}
+h1{font-size:18px;margin:16px 0 8px}
+p{color:#aebce3;font-size:14px;margin:0}
+.icon{font-size:48px}
+</style></head><body>
+<div class="card">
+<div class="icon">⏰</div>
+<h1>%s</h1>
+<p>This temporary website link is no longer available.</p>
+</div>
+</body></html>`,
+		html.EscapeString(message),
+	)
+}
+
 func writeHomePage(w http.ResponseWriter, cfg Config) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
 	adminStatus := "disabled"
+	adminLink := ""
 	if cfg.AdminPassword != "" {
 		adminStatus = "enabled"
+		adminLink = fmt.Sprintf(` — <a href="%s">Open Dashboard</a>`, html.EscapeString(cfg.AdminPath))
 	}
 
 	_, _ = fmt.Fprintf(w, `<!doctype html>
-<html lang="en">
-<head>
+<html lang="en"><head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Telegram Static Site Host Bot V2</title>
 <style>
-body{font-family:Arial,sans-serif;background:#0b1020;color:#e8eefc;margin:0;padding:32px}
-.card{max-width:950px;margin:auto;background:#121a33;border:1px solid #26345e;border-radius:18px;padding:24px;box-shadow:0 20px 50px rgba(0,0,0,.35)}
-h1{margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:18px 0}
-.badge,.metric{background:#1f2a4d;border:1px solid #344678;border-radius:14px;padding:12px}
-.metric b{display:block;font-size:24px}code{background:#0b1020;border:1px solid #26345e;border-radius:8px;padding:2px 6px}
-.small{color:#aebce3;font-size:14px}
+*{box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;background:#0b1020;color:#e8eefc;margin:0;padding:32px 20px;min-height:100vh}
+.card{max-width:860px;margin:auto;background:#121a33;border:1px solid #26345e;border-radius:20px;padding:32px;box-shadow:0 24px 60px rgba(0,0,0,.4)}
+h1{margin:0 0 8px;font-size:24px}
+.desc{color:#aebce3;margin:0 0 24px;font-size:15px;line-height:1.6}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:0 0 24px}
+.metric{background:#1a2447;border:1px solid #344678;border-radius:14px;padding:16px}
+.metric label{display:block;font-size:11px;color:#8ab4ff;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px}
+.metric b{display:block;font-size:26px;font-weight:700}
+.features{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px;margin-bottom:20px}
+.feature{background:#131c38;border:1px solid #1e2e55;border-radius:10px;padding:10px 14px;font-size:13px;color:#c8d8f8}
+.small{color:#aebce3;font-size:13px;line-height:1.7}
+a{color:#8ab4ff}
+code{background:#0b1020;border:1px solid #26345e;border-radius:6px;padding:2px 6px;font-size:13px}
 </style>
-</head>
-<body>
+</head><body>
 <div class="card">
 <h1>🌐 Telegram Static Site Host Bot V2</h1>
-<p>Upload a ZIP project to the Telegram bot. The ZIP must contain <code>index.html</code>. The bot hosts it as a temporary public website.</p>
+<p class="desc">Upload a <code>.zip</code> project (must contain <code>index.html</code>) to the Telegram bot to get a temporary public website URL and QR code instantly.</p>
 <div class="grid">
-<div class="metric">TTL <b>%s</b></div>
-<div class="metric">Max project <b>%dMB</b></div>
-<div class="metric">Hosted sites <b>%d</b></div>
-<div class="metric">Total views <b>%d</b></div>
+  <div class="metric"><label>Link TTL</label><b>%s</b></div>
+  <div class="metric"><label>Max Project</label><b>%d MB</b></div>
+  <div class="metric"><label>Hosted Sites</label><b>%d</b></div>
+  <div class="metric"><label>Total Views</label><b>%d</b></div>
 </div>
-<p class="small">Features: QR code, admin dashboard, password protection, user site manager, project auto-detect, ZIP security scanner.</p>
-<p class="small">Admin dashboard: %s at <code>%s</code></p>
+<div class="features">
+  <div class="feature">✅ QR Code</div>
+  <div class="feature">✅ Admin Dashboard</div>
+  <div class="feature">✅ Auto-detect project type</div>
+  <div class="feature">✅ Password protection</div>
+  <div class="feature">✅ User site manager</div>
+  <div class="feature">✅ ZIP security scanner</div>
 </div>
-</body>
-</html>`,
+<p class="small">Admin dashboard: <strong>%s</strong>%s<br>Healthcheck: <a href="/healthz"><code>/healthz</code></a></p>
+</div>
+</body></html>`,
 		html.EscapeString(humanDuration(cfg.LinkTTL)),
 		cfg.MaxProjectMB,
 		store.Count(),
 		atomic.LoadInt64(&totalViews),
-		adminStatus,
-		html.EscapeString(cfg.AdminPath),
+		html.EscapeString(adminStatus),
+		adminLink,
 	)
 }
+
+// ─────────────────────────────────────────────
+// Cleanup goroutine
+// ─────────────────────────────────────────────
 
 func cleanupExpiredSites() {
 	ticker := time.NewTicker(1 * time.Minute)
@@ -1365,18 +1682,20 @@ func cleanupExpiredSites() {
 
 	for range ticker.C {
 		now := time.Now()
-		expired := store.Expired(now)
-
-		for _, s := range expired {
+		for _, s := range store.Expired(now) {
 			store.Delete(s.Token)
 			if err := os.RemoveAll(s.BaseDir); err != nil {
-				log.Printf("cleanup expired site failed: %s: %v", s.BaseDir, err)
+				log.Printf("cleanup: failed to remove %s: %v", s.BaseDir, err)
 			} else {
-				log.Printf("expired site removed: %s", s.BaseDir)
+				log.Printf("cleanup: removed expired site %s", s.Token)
 			}
 		}
 	}
 }
+
+// ─────────────────────────────────────────────
+// HTTP helpers
+// ─────────────────────────────────────────────
 
 func setStaticHeaders(w http.ResponseWriter, path string, site HostedSite) {
 	ext := strings.ToLower(filepath.Ext(path))
@@ -1399,7 +1718,6 @@ func setStaticHeaders(w http.ResponseWriter, path string, site HostedSite) {
 			contentType = "application/octet-stream"
 		}
 	}
-
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Link-Expires-At", site.ExpiresAt.Format(time.RFC3339))
@@ -1413,6 +1731,10 @@ func securityHeaders(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
+// ─────────────────────────────────────────────
+// Store methods
+// ─────────────────────────────────────────────
 
 func (s *SiteStore) Add(site HostedSite) {
 	s.mu.Lock()
@@ -1448,39 +1770,41 @@ func (s *SiteStore) Count() int {
 func (s *SiteStore) All() []HostedSite {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
-	sites := make([]HostedSite, 0, len(s.sites))
+	result := make([]HostedSite, 0, len(s.sites))
 	for _, site := range s.sites {
-		sites = append(sites, site)
+		result = append(result, site)
 	}
-	return sites
+	return result
 }
 
 func (s *SiteStore) ByUser(userID int64) []HostedSite {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
-	sites := make([]HostedSite, 0)
+	now := time.Now()
+	var result []HostedSite
 	for _, site := range s.sites {
-		if site.UploadedBy == userID && time.Now().Before(site.ExpiresAt) {
-			sites = append(sites, site)
+		if site.UploadedBy == userID && now.Before(site.ExpiresAt) {
+			result = append(result, site)
 		}
 	}
-	return sites
+	return result
 }
 
 func (s *SiteStore) Expired(now time.Time) []HostedSite {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
-	var expired []HostedSite
+	var result []HostedSite
 	for _, site := range s.sites {
 		if now.After(site.ExpiresAt) {
-			expired = append(expired, site)
+			result = append(result, site)
 		}
 	}
-	return expired
+	return result
 }
+
+// ─────────────────────────────────────────────
+// User store methods
+// ─────────────────────────────────────────────
 
 func (u *UserStore) Get(userID int64) UserSettings {
 	u.mu.RLock()
@@ -1495,6 +1819,72 @@ func (u *UserStore) SetPassword(userID int64, password string) {
 	s.NextPassword = password
 	u.settings[userID] = s
 }
+
+// ─────────────────────────────────────────────
+// Telegram helpers
+// ─────────────────────────────────────────────
+
+// sendMD sends a MarkdownV2-formatted message.
+func sendMD(bot *tgbotapi.BotAPI, chatID int64, text string) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = tgbotapi.ModeMarkdownV2
+	msg.DisableWebPagePreview = true
+	_, _ = bot.Send(msg)
+}
+
+// sendWithButtons sends a MarkdownV2 message with inline keyboard.
+func sendWithButtons(bot *tgbotapi.BotAPI, chatID int64, text string, buttons [][]tgbotapi.InlineKeyboardButton) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = tgbotapi.ModeMarkdownV2
+	msg.DisableWebPagePreview = true
+	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(buttons...)
+	_, _ = bot.Send(msg)
+}
+
+// editMD edits an existing message with MarkdownV2 text.
+func editMD(bot *tgbotapi.BotAPI, chatID int64, messageID int, text string) {
+	if messageID == 0 {
+		return
+	}
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
+	edit.ParseMode = tgbotapi.ModeMarkdownV2
+	edit.DisableWebPagePreview = boolPtr(true)
+	_, _ = bot.Send(edit)
+}
+
+// editMsgWithButtons edits an existing message with MarkdownV2 text and inline keyboard.
+func editMsgWithButtons(bot *tgbotapi.BotAPI, chatID int64, messageID int, text string, buttons [][]tgbotapi.InlineKeyboardButton) {
+	if messageID == 0 {
+		return
+	}
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
+	edit.ParseMode = tgbotapi.ModeMarkdownV2
+	edit.DisableWebPagePreview = boolPtr(true)
+	markup := tgbotapi.NewInlineKeyboardMarkup(buttons...)
+	edit.ReplyMarkup = &markup
+	_, _ = bot.Send(edit)
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+// escapeMarkdownV2 escapes all special characters required by Telegram MarkdownV2.
+func escapeMarkdownV2(s string) string {
+	// Characters that must be escaped in MarkdownV2 outside of code/pre spans
+	special := `\_*[]()~` + "`" + `>#+-=|{}.!`
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	for _, r := range s {
+		if strings.ContainsRune(special, r) {
+			b.WriteRune('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// ─────────────────────────────────────────────
+// Path utilities
+// ─────────────────────────────────────────────
 
 func cleanZipName(name string) (string, error) {
 	name = strings.ReplaceAll(name, "\\", "/")
@@ -1535,12 +1925,10 @@ func isInsideBase(base string, target string) bool {
 	if err != nil {
 		return false
 	}
-
 	rel, err := filepath.Rel(baseAbs, targetAbs)
 	if err != nil {
 		return false
 	}
-
 	return rel == "." || (!strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != "..")
 }
 
@@ -1548,6 +1936,10 @@ func fileExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && !info.IsDir()
 }
+
+// ─────────────────────────────────────────────
+// IO utilities
+// ─────────────────────────────────────────────
 
 type limitedReader struct {
 	R   io.Reader
@@ -1588,7 +1980,6 @@ func safeLocalName(name string) string {
 	if len(out) > 120 {
 		out = out[:120]
 	}
-
 	return out
 }
 
@@ -1597,102 +1988,17 @@ func clearUploadDir(uploadDir string) error {
 	if err != nil {
 		return err
 	}
-
 	for _, e := range entries {
 		if err := os.RemoveAll(filepath.Join(uploadDir, e.Name())); err != nil {
 			return err
 		}
 	}
-
 	return nil
 }
 
-func helpText(cfg Config) string {
-	admin := "disabled"
-	if cfg.AdminPassword != "" {
-		admin = cfg.PublicBaseURL + cfg.AdminPath
-	}
-
-	return fmt.Sprintf(`🌐 Telegram Static Site Host Bot V2
-
-របៀបប្រើ:
-1. Compress HTML project to .zip
-2. Make sure it contains index.html
-3. Upload the .zip to this bot
-4. Bot returns public website URL + QR Code
-5. Link expires after %s and files auto delete
-
-Commands:
-/help - show help
-/status - bot status
-/my_sites - list your active websites
-/delete_site TOKEN - delete your website
-/extend_site TOKEN 60 - extend website 60 minutes
-/password 1234 - set password for next uploads
-/password off - disable password for next uploads
-
-Features:
-✅ QR Code
-✅ Admin Dashboard
-✅ Auto Detect Project Type
-✅ Password Protected Website
-✅ User Project Manager
-✅ ZIP Security Scanner
-
-Supported:
-HTML, CSS, JS, images, fonts, JSON, static assets.
-
-Not supported:
-PHP, Python, Node backend, database, server-side execution.
-
-Limits:
-- Max project: %dMB
-- Max single file: %dMB
-- Max zip files: %d
-- Link TTL: %s
-- Max TTL: %s
-- SPA fallback: %s
-- Admin: %s`,
-		humanDuration(cfg.LinkTTL),
-		cfg.MaxProjectMB,
-		cfg.MaxSingleFileMB,
-		cfg.MaxZipEntries,
-		humanDuration(cfg.LinkTTL),
-		humanDuration(cfg.MaxTTL),
-		yesNo(cfg.SPAFallback),
-		admin,
-	)
-}
-
-func statusText(cfg Config) string {
-	return fmt.Sprintf(
-		"📊 Bot status\n\nUptime: %s\nActive uploads: %d\nTotal hosted sites: %d\nHosted sites now: %d\nTotal views: %d\nMax project: %dMB\nMax single file: %dMB\nMax zip entries: %d\nLink TTL: %s\nPublic base URL: %s\nAdmin dashboard: %s",
-		time.Since(startedAt).Round(time.Second),
-		atomic.LoadInt64(&activeUploads),
-		atomic.LoadInt64(&totalSites),
-		store.Count(),
-		atomic.LoadInt64(&totalViews),
-		cfg.MaxProjectMB,
-		cfg.MaxSingleFileMB,
-		cfg.MaxZipEntries,
-		humanDuration(cfg.LinkTTL),
-		cfg.PublicBaseURL,
-		cfg.AdminPath,
-	)
-}
-
-func sendText(bot *tgbotapi.BotAPI, chatID int64, text string) {
-	msg := tgbotapi.NewMessage(chatID, text)
-	_, _ = bot.Send(msg)
-}
-
-func editStatus(bot *tgbotapi.BotAPI, chatID int64, messageID int, text string) {
-	if messageID == 0 {
-		return
-	}
-	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
-	_, _ = bot.Send(edit)
-}
+// ─────────────────────────────────────────────
+// Crypto utilities
+// ─────────────────────────────────────────────
 
 func newToken() (string, error) {
 	buf := make([]byte, 24)
@@ -1707,7 +2013,6 @@ func hashPassword(password string) (string, string, error) {
 	if _, err := rand.Read(saltBytes); err != nil {
 		return "", "", err
 	}
-
 	salt := hex.EncodeToString(saltBytes)
 	sum := sha256.Sum256([]byte(salt + ":" + password))
 	return salt, hex.EncodeToString(sum[:]), nil
@@ -1719,26 +2024,29 @@ func verifyPassword(password, salt, expectedHash string) bool {
 	return subtle.ConstantTimeCompare([]byte(got), []byte(expectedHash)) == 1
 }
 
+// ─────────────────────────────────────────────
+// Format helpers
+// ─────────────────────────────────────────────
+
 func humanDuration(d time.Duration) string {
-	if d < 0 {
-		d = 0
+	if d <= 0 {
+		return "0s"
 	}
 	d = d.Round(time.Second)
-
 	h := int(d.Hours())
 	m := int(d.Minutes()) % 60
 	s := int(d.Seconds()) % 60
 
-	if h > 0 && m > 0 {
+	switch {
+	case h > 0 && m > 0:
 		return fmt.Sprintf("%dh %dm", h, m)
-	}
-	if h > 0 {
+	case h > 0:
 		return fmt.Sprintf("%dh", h)
-	}
-	if m > 0 {
+	case m > 0:
 		return fmt.Sprintf("%dm", m)
+	default:
+		return fmt.Sprintf("%ds", s)
 	}
-	return fmt.Sprintf("%ds", s)
 }
 
 func truncate(s string, max int) string {
@@ -1750,6 +2058,28 @@ func truncate(s string, max int) string {
 	}
 	return s[:max-3] + "..."
 }
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func yesNo(v bool) string {
+	if v {
+		return "yes"
+	}
+	return "no"
+}
+
+func trimRightSlash(s string) string {
+	return strings.TrimRight(strings.TrimSpace(s), "/")
+}
+
+// ─────────────────────────────────────────────
+// Env helpers
+// ─────────────────────────────────────────────
 
 func envString(key, def string) string {
 	v := strings.TrimSpace(os.Getenv(key))
@@ -1798,34 +2128,33 @@ func envBool(key string, def bool) bool {
 	}
 }
 
-func parseAllowedUsers(raw string) map[int64]bool {
+func parseUserIDs(raw string) map[int64]bool {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil
 	}
-
 	result := make(map[int64]bool)
 	for _, part := range strings.Split(raw, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
 		}
-
 		id, err := strconv.ParseInt(part, 10, 64)
 		if err != nil {
-			log.Printf("invalid ALLOWED_USER_IDS value ignored: %q", part)
+			log.Printf("invalid user ID ignored: %q", part)
 			continue
 		}
-
 		result[id] = true
 	}
-
 	if len(result) == 0 {
 		return nil
 	}
-
 	return result
 }
+
+// ─────────────────────────────────────────────
+// Message helpers
+// ─────────────────────────────────────────────
 
 func safeFromID(msg *tgbotapi.Message) int64 {
 	if msg != nil && msg.From != nil {
@@ -1838,33 +2167,25 @@ func usernameFromMessage(msg *tgbotapi.Message) string {
 	if msg == nil || msg.From == nil {
 		return "unknown"
 	}
-
 	if msg.From.UserName != "" {
 		return "@" + msg.From.UserName
 	}
-
 	name := strings.TrimSpace(msg.From.FirstName + " " + msg.From.LastName)
 	if name == "" {
 		return strconv.FormatInt(msg.From.ID, 10)
 	}
-
 	return name
 }
 
+// isAdminUser returns true if userID is listed in ADMIN_USER_IDS.
+// Falls back to ALLOWED_USER_IDS if no dedicated admin list is configured.
 func isAdminUser(cfg Config, userID int64) bool {
-	if cfg.AllowedUsers == nil {
-		return false
+	if cfg.AdminUserIDs != nil {
+		return cfg.AdminUserIDs[userID]
 	}
-	return cfg.AllowedUsers[userID]
-}
-
-func yesNo(v bool) string {
-	if v {
-		return "yes"
+	// When no dedicated admin list, allowed users are treated as admins
+	if cfg.AllowedUsers != nil {
+		return cfg.AllowedUsers[userID]
 	}
-	return "no"
-}
-
-func trimRightSlash(s string) string {
-	return strings.TrimRight(strings.TrimSpace(s), "/")
+	return false
 }
